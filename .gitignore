@@ -1,0 +1,26 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Local environments and credentials
+.env
+.env.*
+.venv/
+venv/
+
+# Large or redistributed research artifacts
+**/*.pdf
+**/*.zip
+**/*.tar.gz
+**/*.tgz
+**/prior_research/*/paper.md
+**/prior_research/*/source.md
+**/prior_research/*/source/
+
+# Local/generated workspace runs
+example_project/
+example_project_pathology/
+data/*
+!data/README.md
+probes/*
+!probes/.gitkeep
