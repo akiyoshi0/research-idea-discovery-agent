@@ -34,6 +34,25 @@ discovery_state/hypothesis_bank.md
 - 説明、`probe.md`、`data/README.md`、`hypothesis_bank.md`更新は日本語で書く。
 - DB名、dataset ID、gene symbol、compound ID、metric名、API名、file pathは原表記を残す。
 
+# 文章表現の方針
+
+- `probe.md`と`hypothesis_bank.md`更新は、実験ログではなく、人間が仮説を続けるか判断するための作業メモとして書く。
+- 論文由来の英語専門語やmetric名をそのまま並べない。初出では必ず短い日本語説明を添える。
+- DB名、dataset ID、gene symbol、compound ID、正式なmetric名は原表記を残してよいが、概念語はできるだけ日本語で噛み砕く。
+- 「有意」「改善」「安定」などの曖昧な語だけで終わらせず、何と比べて、どの程度、なぜ次の判断に関係するかを書く。
+- 1文に専門語を複数詰め込まない。専門家が読んでも、頭の中で翻訳し直さなくてよい文章にする。
+
+言い換え例:
+
+```text
+replicate ceiling -> 同じ条件を繰り返したときに、測定値がどこまで一致するかという上限
+generic response -> 多くの薬剤や条件で共通して出る反応
+conservative collapse -> モデルが安全側に倒れて、変化量を小さく予測してしまう現象
+signature reversal -> 疾患で増減した遺伝子変化を、薬剤で逆向きに戻せるかを見る考え方
+applicability domain -> その予測を信じてよい条件の範囲
+zero-shot context -> 学習時に見ていない条件への予測
+```
+
 # 基本ルール
 
 - data-probeは軽い現実確認であり、論文用の本解析ではない。

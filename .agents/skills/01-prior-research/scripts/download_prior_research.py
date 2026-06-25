@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import html as html_lib
 import json
 import os
 import re
@@ -15,12 +16,13 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlencode, urljoin, urlparse
 
 
 USER_AGENT = "IdeaDiscoveryWorkspace/0.1"
 SEMANTIC_SCHOLAR_API_ROOT = "https://api.semanticscholar.org/graph/v1"
 SEMANTIC_SCHOLAR_FIELDS = "title,externalIds,openAccessPdf,isOpenAccess,url"
+PMC_IDCONV_API_URL = "https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/"
 DIRECT_PYTHON_OVERRIDE_ENV = "IDEA_DISCOVERY_ALLOW_DIRECT_PYTHON"
 SCRIPT_RELATIVE_PATH = ".agents/skills/01-prior-research/scripts/download_prior_research.py"
 
@@ -98,7 +100,7 @@ def append_metadata_note(metadata_path: Path, key: str, note: str) -> str:
     metadata = read_simple_metadata(metadata_path)
     current = metadata.get(key, "")
     if note in current:
-        return f"metadata.yamlの{key}は既にSemantic Scholar取得元を含む"
+        return f"metadata.yamlの{key}は指定した追記内容を既に含む"
 
     value = note if not current else f"{current}; {note}"
     return update_metadata_value(metadata_path, key, value)
@@ -193,6 +195,33 @@ def extract_semantic_scholar_id(*values: str) -> str:
         )
         if match:
             return match.group(1)
+    return ""
+
+
+def extract_pmid(*values: str) -> str:
+    for value in values:
+        if not value:
+            continue
+        patterns = [
+            r"pubmed\.ncbi\.nlm\.nih\.gov/(\d+)",
+            r"(?:PMID|pmid)[:\s]+(\d+)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, value, flags=re.IGNORECASE)
+            if match:
+                return match.group(1)
+    return ""
+
+
+def normalize_pmcid(value: str) -> str:
+    value = value.strip()
+    if not value:
+        return ""
+    pmcid = extract_pmcid(value)
+    if pmcid:
+        return pmcid
+    if value.isdigit():
+        return f"PMC{value}"
     return ""
 
 
@@ -345,6 +374,178 @@ def normalize_open_access_pdf_url(url: str) -> str:
     return ""
 
 
+def direct_pmcids_from_metadata(metadata: dict[str, str]) -> list[str]:
+    values = [
+        metadata.get("pmcid", ""),
+        metadata.get("pmc_id", ""),
+        metadata.get("paper_url", ""),
+        metadata.get("pdf_url", ""),
+        metadata.get("access_note", ""),
+        metadata.get("license_note", ""),
+    ]
+    pmcids: list[str] = []
+    for value in values:
+        pmcid = normalize_pmcid(value)
+        if pmcid and pmcid not in pmcids:
+            pmcids.append(pmcid)
+    return pmcids
+
+
+def pmc_idconv_identifiers(metadata: dict[str, str]) -> list[str]:
+    identifiers: list[str] = []
+
+    pmid = extract_pmid(
+        metadata.get("pmid", ""),
+        metadata.get("pubmed_id", ""),
+        metadata.get("paper_url", ""),
+        metadata.get("pdf_url", ""),
+        metadata.get("access_note", ""),
+    )
+    if pmid:
+        identifiers.append(pmid)
+
+    doi = normalize_doi(metadata.get("doi", ""))
+    if doi:
+        identifiers.append(doi)
+
+    deduped: list[str] = []
+    for identifier in identifiers:
+        if identifier and identifier not in deduped:
+            deduped.append(identifier)
+    return deduped
+
+
+def fetch_pmc_idconv_json(identifiers: list[str]) -> tuple[dict[str, object] | None, str]:
+    if not identifiers:
+        return None, "PMCID解決に使えるPMIDまたはDOIがないためPMC確認をスキップした"
+
+    query = urlencode({"ids": ",".join(identifiers), "format": "json"})
+    url = f"{PMC_IDCONV_API_URL}?{query}"
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            data = response.read()
+    except urllib.error.HTTPError as error:
+        if error.code in {401, 403, 407, 429}:
+            return None, f"NCBI PMC ID Converter取得を停止した: HTTP {error.code}。認証、rate limit、またはアクセス制限の可能性がある"
+        return None, f"NCBI PMC ID Converter取得に失敗した: HTTP {error.code}"
+    except Exception as error:  # noqa: BLE001
+        return None, f"NCBI PMC ID Converter取得に失敗した: {error}"
+
+    try:
+        parsed = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        return None, f"NCBI PMC ID Converter応答をJSONとして読めなかった: {error}"
+
+    if not isinstance(parsed, dict):
+        return None, "NCBI PMC ID Converter応答がJSON objectではないためスキップした"
+    return parsed, "NCBI PMC ID Converter応答を取得した"
+
+
+def pmcids_from_idconv_payload(payload: dict[str, object]) -> list[str]:
+    records = payload.get("records")
+    if not isinstance(records, list):
+        return []
+
+    pmcids: list[str] = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        pmcid_value = record.get("pmcid")
+        if not isinstance(pmcid_value, str):
+            continue
+        pmcid = normalize_pmcid(pmcid_value)
+        if pmcid and pmcid not in pmcids:
+            pmcids.append(pmcid)
+    return pmcids
+
+
+def resolve_pmcids(metadata: dict[str, str]) -> tuple[list[str], list[str]]:
+    direct_pmcids = direct_pmcids_from_metadata(metadata)
+    if direct_pmcids:
+        return direct_pmcids, [f"metadata内のPMCIDを取得した: {', '.join(direct_pmcids)}"]
+
+    identifiers = pmc_idconv_identifiers(metadata)
+    payload, message = fetch_pmc_idconv_json(identifiers)
+    messages = [f"PMID/DOIからPMCIDを確認した: {message}"]
+    if payload is None:
+        return [], messages
+
+    pmcids = pmcids_from_idconv_payload(payload)
+    if pmcids:
+        messages.append(f"NCBI PMC ID ConverterからPMCIDを取得した: {', '.join(pmcids)}")
+    else:
+        messages.append("NCBI PMC ID ConverterにPMCIDがないためPMC PDF取得をスキップした")
+    return pmcids, messages
+
+
+def pmc_article_url(pmcid: str) -> str:
+    return f"https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/"
+
+
+def pmc_pdf_url(pmcid: str) -> str:
+    return f"{pmc_article_url(pmcid)}pdf/"
+
+
+def fetch_html(url: str) -> tuple[str | None, str]:
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            data = response.read()
+    except urllib.error.HTTPError as error:
+        if error.code in {401, 403, 407, 429}:
+            return None, f"HTML取得を停止した: HTTP {error.code}。認証、rate limit、またはアクセス制限の可能性がある"
+        return None, f"HTML取得に失敗した: HTTP {error.code}"
+    except Exception as error:  # noqa: BLE001
+        return None, f"HTML取得に失敗した: {error}"
+
+    return data.decode("utf-8", errors="replace"), "HTMLを取得した"
+
+
+def is_pmc_pdf_candidate_url(url: str, pmcid: str) -> bool:
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    if host not in {"pmc.ncbi.nlm.nih.gov", "www.ncbi.nlm.nih.gov"}:
+        return False
+    path = parsed.path.lower()
+    if extract_pmcid(url) == pmcid:
+        return path.endswith(".pdf") or "/pdf" in path
+    return path.endswith(".pdf") and "/articles/" in path
+
+
+def extract_pmc_pdf_links(html_text: str, base_url: str, pmcid: str) -> list[str]:
+    patterns = [
+        r'<meta[^>]+name=["\']citation_pdf_url["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']citation_pdf_url["\']',
+        r'href=["\']([^"\']*\.pdf(?:\?[^"\']*)?)["\']',
+        r'href=["\']([^"\']*/pdf/?[^"\']*)["\']',
+    ]
+    candidates: list[str] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, html_text, flags=re.IGNORECASE):
+            candidate = html_lib.unescape(match.group(1).strip())
+            candidate_url = urljoin(base_url, candidate)
+            if not is_http_url(candidate_url):
+                continue
+            if not is_pmc_pdf_candidate_url(candidate_url, pmcid):
+                continue
+            if candidate_url not in candidates:
+                candidates.append(candidate_url)
+    return candidates
+
+
+def pmc_article_pdf_candidates(pmcid: str) -> tuple[list[str], str]:
+    article_url = pmc_article_url(pmcid)
+    html_text, message = fetch_html(article_url)
+    if html_text is None:
+        return [], f"PMC article pageからPDF候補を取得できなかった: {message}"
+
+    candidates = extract_pmc_pdf_links(html_text, article_url, pmcid)
+    if not candidates:
+        return [], "PMC article pageにPDF候補リンクが見つからなかった"
+    return candidates, f"PMC article pageからPDF候補を取得した: {', '.join(candidates)}"
+
+
 def semantic_scholar_pdf_candidates(paper: dict[str, object]) -> tuple[list[str], str]:
     open_access_pdf = paper.get("openAccessPdf")
     if not isinstance(open_access_pdf, dict):
@@ -484,6 +685,90 @@ def download_semantic_scholar_pdf(
     return messages
 
 
+def pmc_access_note(pmcid: str, pdf_url: str) -> str:
+    return (
+        f"PMC Free Full Text経由で取得: {pdf_url}; "
+        f"PMCID={pmcid}; PMC article URL={pmc_article_url(pmcid)}"
+    )
+
+
+def download_pmc_pdf(
+    metadata: dict[str, str],
+    metadata_path: Path,
+    destination: Path,
+    force: bool,
+) -> list[str]:
+    messages = ["PMC Free Full TextによるPDF取得を試行した"]
+    pmcids, resolve_messages = resolve_pmcids(metadata)
+    messages.extend(resolve_messages)
+    if not pmcids:
+        return messages
+
+    messages.append(update_metadata_value(metadata_path, "pmcid", pmcids[0]))
+
+    for pmcid in pmcids:
+        candidate_urls = [pmc_pdf_url(pmcid)]
+        for candidate_url in candidate_urls:
+            pdf_message = download_pdf(candidate_url, destination, force)
+            messages.append(f"PMC候補PDFの取得結果: {pdf_message}")
+            if destination.exists():
+                if pmcid != pmcids[0]:
+                    messages.append(update_metadata_value(metadata_path, "pmcid", pmcid))
+                messages.append(update_metadata_value(metadata_path, "pdf_url", candidate_url))
+                messages.append(append_metadata_note(metadata_path, "access_note", pmc_access_note(pmcid, candidate_url)))
+                return messages
+
+        article_candidates, article_message = pmc_article_pdf_candidates(pmcid)
+        messages.append(article_message)
+        for candidate_url in article_candidates:
+            if looks_sensitive_url(candidate_url):
+                messages.append("PMC候補URLに認証情報・token・privateを示す文字列があるためPDF保存を停止した")
+                continue
+            pdf_message = download_pdf(candidate_url, destination, force)
+            messages.append(f"PMC article page候補PDFの取得結果: {pdf_message}")
+            if destination.exists():
+                if pmcid != pmcids[0]:
+                    messages.append(update_metadata_value(metadata_path, "pmcid", pmcid))
+                messages.append(update_metadata_value(metadata_path, "pdf_url", candidate_url))
+                messages.append(append_metadata_note(metadata_path, "access_note", pmc_access_note(pmcid, candidate_url)))
+                return messages
+
+    messages.append("PMC候補からpaper.pdfを保存できなかった")
+    return messages
+
+
+def manual_pdf_candidate_urls(metadata: dict[str, str]) -> list[str]:
+    candidates: list[str] = []
+
+    pdf_url = metadata.get("pdf_url", "").strip()
+    if is_http_url(pdf_url):
+        candidates.append(pdf_url)
+
+    pmcids = direct_pmcids_from_metadata(metadata)
+    for pmcid in pmcids:
+        candidate = pmc_pdf_url(pmcid)
+        if candidate not in candidates:
+            candidates.append(candidate)
+
+    paper_url = metadata.get("paper_url", "").strip()
+    if is_http_url(paper_url) and paper_url not in candidates:
+        candidates.append(paper_url)
+
+    doi = normalize_doi(metadata.get("doi", ""))
+    if doi:
+        doi_url = f"https://doi.org/{doi}"
+        if doi_url not in candidates:
+            candidates.append(doi_url)
+
+    return candidates
+
+
+def manual_pdf_download_guidance(metadata: dict[str, str], destination: Path) -> str:
+    candidates = manual_pdf_candidate_urls(metadata)
+    candidate_text = ", ".join(candidates) if candidates else "候補URLなし。paper_url、pdf_url、doi、pmcidをmetadata.yamlに追記してください"
+    return f"手動PDF取得候補URL: {candidate_text}; 保存先: {destination}"
+
+
 def load_ingest_module() -> object:
     script_path = Path(__file__).with_name("ingest_prior_research.py")
     spec = importlib.util.spec_from_file_location("ingest_prior_research", script_path)
@@ -531,6 +816,14 @@ def download_prior_research(
         pdf_message = download_pdf(pdf_url, pdf_path, force)
         messages.append(pdf_message)
         if not pdf_path.exists():
+            pmc_messages = download_pmc_pdf(
+                metadata,
+                metadata_path,
+                pdf_path,
+                force,
+            )
+            messages.extend(pmc_messages)
+        if not pdf_path.exists():
             semantic_scholar_messages = download_semantic_scholar_pdf(
                 metadata,
                 metadata_path,
@@ -540,6 +833,8 @@ def download_prior_research(
             messages.extend(semantic_scholar_messages)
         if not pdf_path.exists():
             messages.append("paper.pdfを保存できなかったためpaper.mdは作成しない。paper.mdは必ずpaper.pdfから変換する")
+            latest_metadata = read_simple_metadata(metadata_path)
+            messages.append(manual_pdf_download_guidance(latest_metadata, pdf_path))
     if not pdf_only:
         if code_url:
             if ingest_after_download:
@@ -562,8 +857,8 @@ def download_prior_research(
 
 
 def extract_pmcid(url_or_text: str) -> str:
-    match = re.search(r"PMC\d+", url_or_text, flags=re.IGNORECASE)
-    return match.group(0).upper() if match else ""
+    match = re.search(r"PMC\s*\d+", url_or_text, flags=re.IGNORECASE)
+    return re.sub(r"\s+", "", match.group(0)).upper() if match else ""
 
 
 def main() -> int:

@@ -12,6 +12,8 @@ METADATA_TEMPLATE = """title: ""
 authors: []
 year: ""
 doi: ""
+pmid: ""
+pmcid: ""
 paper_url: ""
 pdf_url: ""
 code_url: ""

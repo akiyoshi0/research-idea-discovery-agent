@@ -49,6 +49,8 @@ def write_item(root: Path, metadata: dict[str, str]) -> Path:
     defaults = {
         "title": "",
         "doi": "",
+        "pmid": "",
+        "pmcid": "",
         "paper_url": "",
         "pdf_url": "",
         "code_url": "",
@@ -81,6 +83,13 @@ def semantic_scholar_payload(
             },
         }
     ).encode("utf-8")
+
+
+def pmc_idconv_payload(pmcid: str = "", *, pmid: str = "12345678", doi: str = "10.123/example") -> bytes:
+    record: dict[str, str] = {"pmid": pmid, "doi": doi}
+    if pmcid:
+        record["pmcid"] = pmcid
+    return json.dumps({"status": "ok", "records": [record]}).encode("utf-8")
 
 
 class DownloadPriorResearchTests(unittest.TestCase):
@@ -153,6 +162,8 @@ class DownloadPriorResearchTests(unittest.TestCase):
             )
 
             def route(url: str) -> FakeResponse:
+                if "pmc/utils/idconv" in url:
+                    return FakeResponse(pmc_idconv_payload(), "application/json", url)
                 if "api.semanticscholar.org" in url:
                     return FakeResponse(
                         semantic_scholar_payload("https://open.example/paper.pdf", license_value="CC-BY"),
@@ -187,6 +198,8 @@ class DownloadPriorResearchTests(unittest.TestCase):
             def route(url: str) -> FakeResponse:
                 if url == "https://publisher.example/paper":
                     return FakeResponse(b"<html>not pdf</html>", "text/html", url)
+                if "pmc/utils/idconv" in url:
+                    return FakeResponse(pmc_idconv_payload(), "application/json", url)
                 if "api.semanticscholar.org" in url:
                     return FakeResponse(
                         semantic_scholar_payload("https://www.ncbi.nlm.nih.gov/pmc/articles/PMC1234567"),
@@ -206,6 +219,78 @@ class DownloadPriorResearchTests(unittest.TestCase):
             metadata = (item_dir / "metadata.yaml").read_text(encoding="utf-8")
             self.assertIn('pdf_url: "https://pmc.ncbi.nlm.nih.gov/articles/PMC1234567/pdf/"', metadata)
 
+    def test_publisher_failure_uses_pmc_pdf_from_pubmed_idconv_before_semantic_scholar(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            item_dir = write_item(
+                Path(tmpdir),
+                {
+                    "doi": "10.1016/j.ctarc.2020.100174",
+                    "paper_url": "https://pubmed.ncbi.nlm.nih.gov/32413603/",
+                    "pdf_url": "https://publisher.example/pdfft",
+                    "title": "Example Paper",
+                },
+            )
+
+            def route(url: str) -> FakeResponse:
+                if url == "https://publisher.example/pdfft":
+                    raise HTTPError(url, 403, "Forbidden", hdrs=None, fp=None)
+                if "pmc/utils/idconv" in url:
+                    return FakeResponse(
+                        pmc_idconv_payload("PMC7572629", pmid="32413603", doi="10.1016/j.ctarc.2020.100174"),
+                        "application/json",
+                        url,
+                    )
+                if url == "https://pmc.ncbi.nlm.nih.gov/articles/PMC7572629/pdf/":
+                    return FakeResponse(b"%PDF-1.4\n", "application/pdf", url)
+                if "api.semanticscholar.org" in url:
+                    raise AssertionError("Semantic Scholar should not be called after PMC PDF success")
+                raise AssertionError(f"unexpected URL: {url}")
+
+            messages, calls = self.run_with_fake_network(item_dir, route)
+
+            self.assertTrue((item_dir / "paper.pdf").exists())
+            self.assertTrue(any("pmc/utils/idconv" in call for call in calls))
+            self.assertIn("https://pmc.ncbi.nlm.nih.gov/articles/PMC7572629/pdf/", calls)
+            self.assertFalse(any("api.semanticscholar.org" in call for call in calls))
+            self.assertTrue(any("PMC候補PDFの取得結果" in message for message in messages))
+            metadata = (item_dir / "metadata.yaml").read_text(encoding="utf-8")
+            self.assertIn('pmcid: "PMC7572629"', metadata)
+            self.assertIn('pdf_url: "https://pmc.ncbi.nlm.nih.gov/articles/PMC7572629/pdf/"', metadata)
+            self.assertIn("PMC Free Full Text経由で取得", metadata)
+
+    def test_pmc_article_page_citation_pdf_url_is_used_when_pmc_pdf_path_returns_html(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            item_dir = write_item(
+                Path(tmpdir),
+                {
+                    "paper_url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC1234567/",
+                    "pdf_url": "https://publisher.example/paper",
+                },
+            )
+
+            def route(url: str) -> FakeResponse:
+                if url == "https://publisher.example/paper":
+                    return FakeResponse(b"<html>not pdf</html>", "text/html", url)
+                if url == "https://pmc.ncbi.nlm.nih.gov/articles/PMC1234567/pdf/":
+                    return FakeResponse(b"<html>pmc pdf landing</html>", "text/html", url)
+                if url == "https://pmc.ncbi.nlm.nih.gov/articles/PMC1234567/":
+                    return FakeResponse(
+                        b'<html><meta name="citation_pdf_url" content="/articles/PMC1234567/pdf/main.pdf"></html>',
+                        "text/html",
+                        url,
+                    )
+                if url == "https://pmc.ncbi.nlm.nih.gov/articles/PMC1234567/pdf/main.pdf":
+                    return FakeResponse(b"%PDF-1.4\n", "application/pdf", url)
+                raise AssertionError(f"unexpected URL: {url}")
+
+            _messages, calls = self.run_with_fake_network(item_dir, route)
+
+            self.assertTrue((item_dir / "paper.pdf").exists())
+            self.assertIn("https://pmc.ncbi.nlm.nih.gov/articles/PMC1234567/pdf/main.pdf", calls)
+            metadata = (item_dir / "metadata.yaml").read_text(encoding="utf-8")
+            self.assertIn('pmcid: "PMC1234567"', metadata)
+            self.assertIn('pdf_url: "https://pmc.ncbi.nlm.nih.gov/articles/PMC1234567/pdf/main.pdf"', metadata)
+
     def test_semantic_scholar_429_logs_without_metadata_update(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             item_dir = write_item(
@@ -214,6 +299,8 @@ class DownloadPriorResearchTests(unittest.TestCase):
             )
 
             def route(url: str) -> FakeResponse:
+                if "pmc/utils/idconv" in url:
+                    return FakeResponse(pmc_idconv_payload(), "application/json", url)
                 if "api.semanticscholar.org" in url:
                     raise HTTPError(url, 429, "Too Many Requests", hdrs=None, fp=None)
                 raise AssertionError(f"unexpected URL: {url}")
@@ -227,6 +314,8 @@ class DownloadPriorResearchTests(unittest.TestCase):
             self.assertIn('access_note: ""', metadata)
             notes = (item_dir / "idea_notes.md").read_text(encoding="utf-8")
             self.assertIn("HTTP 429", notes)
+            self.assertIn("手動PDF取得候補URL", notes)
+            self.assertIn(str(item_dir / "paper.pdf"), notes)
 
     def test_pmc_xml_does_not_create_markdown_without_pdf(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -243,6 +332,8 @@ class DownloadPriorResearchTests(unittest.TestCase):
             def route(url: str) -> FakeResponse:
                 if url == "https://pmc.ncbi.nlm.nih.gov/articles/PMC1234567/pdf/":
                     return FakeResponse(b"<html>not pdf</html>", "text/html", url)
+                if url == "https://pmc.ncbi.nlm.nih.gov/articles/PMC1234567/":
+                    return FakeResponse(b"<html>no pdf link</html>", "text/html", url)
                 if "api.semanticscholar.org" in url:
                     raise HTTPError(url, 429, "Too Many Requests", hdrs=None, fp=None)
                 if "eutils.ncbi.nlm.nih.gov" in url:
@@ -255,8 +346,12 @@ class DownloadPriorResearchTests(unittest.TestCase):
             self.assertFalse((item_dir / "paper.md").exists())
             self.assertFalse(any("eutils.ncbi.nlm.nih.gov" in call for call in calls))
             self.assertTrue(any("paper.mdは作成しない" in message for message in messages))
+            self.assertTrue(any("手動PDF取得候補URL" in message for message in messages))
+            self.assertTrue(any(str(item_dir / "paper.pdf") in message for message in messages))
             notes = (item_dir / "idea_notes.md").read_text(encoding="utf-8")
             self.assertIn("paper.mdは作成しない", notes)
+            self.assertIn("https://pmc.ncbi.nlm.nih.gov/articles/PMC1234567/pdf/", notes)
+            self.assertIn(str(item_dir / "paper.pdf"), notes)
 
     def test_title_search_requires_exact_match_when_ids_are_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

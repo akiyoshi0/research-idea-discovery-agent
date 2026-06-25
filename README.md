@@ -2,6 +2,8 @@
 
 このワークスペースは、研究者の初期的な関心を、具体的な`discovery_state/research_plan.md`へ落とし込むためのローカル環境です。
 
+cloneして使う詳しい手順は、[Cloneして使うための説明書](docs/clone_usage_guide_ja.md)を参照してください。
+
 構成は意図的に小さく保ちます。
 
 ```text

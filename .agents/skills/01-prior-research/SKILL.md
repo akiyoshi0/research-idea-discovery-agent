@@ -37,6 +37,25 @@ prior_research/<paper_id>/
 - 説明と`idea_notes.md`は日本語で書く。
 - 論文タイトル、著者名、DOI、URL、repository名、ライセンス名、API名は原表記を残す。
 
+# 文章表現の方針
+
+- `idea_notes.md`は論文の表現を写す場所ではなく、研究アイデア探索に使うための読解メモとして書く。
+- 論文由来の英語専門語をそのまま並べない。初出では必ず短い日本語説明を添える。
+- データセット名、モデル名、正式な評価指標名、API名は原表記を残してよいが、概念語はできるだけ日本語で噛み砕く。
+- 「著者らはXを示した」で止めず、「このworkspaceの仮説やgapにどう関係するか」まで平易に書く。
+- 1文に専門語を複数詰め込まない。専門家が読んでも、頭の中で翻訳し直さなくてよい文章にする。
+
+言い換え例:
+
+```text
+replicate ceiling -> 同じ条件を繰り返したときに、測定値がどこまで一致するかという上限
+generic response -> 多くの薬剤や条件で共通して出る反応
+conservative collapse -> モデルが安全側に倒れて、変化量を小さく予測してしまう現象
+signature reversal -> 疾患で増減した遺伝子変化を、薬剤で逆向きに戻せるかを見る考え方
+applicability domain -> その予測を信じてよい条件の範囲
+zero-shot context -> 学習時に見ていない条件への予測
+```
+
 # 基本ルール
 
 - paywallを回避しない。
@@ -93,6 +112,8 @@ title: ""
 authors: []
 year: ""
 doi: ""
+pmid: ""
+pmcid: ""
 paper_url: ""
 pdf_url: ""
 code_url: ""
@@ -133,10 +154,13 @@ ingested_at: ""
 
 - 人間が合法的に取得したPDFは`paper.pdf`として配置する。
 - `metadata.yaml`の`pdf_url`が公開・合法アクセス可能なPDFを指す場合だけ、`paper.pdf`として取得してよい。
+- 雑誌HPのPDFが見つからない、HTML応答、HTTP 403/challenge、有料公開などで保存できず、PMCIDまたはPMC Free Full Textが確認できる場合は、PMCの公開PDFを取得候補にする。
+- PMCIDは`metadata.yaml`の`pmcid`、`paper_url`、`pdf_url`から拾う。PMCIDが直接ない場合は、公開情報である`pmid`、PubMed URL、DOIをNCBI PMC ID Converterに問い合わせてPMCIDを確認してよい。
 - `pdf_url`が空、HTTP失敗、HTML応答、landing page応答などで`paper.pdf`を保存できない場合は、Semantic Scholar Academic Graph APIの`openAccessPdf`を確認してよい。
 - Semantic Scholar経由で使ってよいのは、`openAccessPdf.url`が示す公開OA候補と、そこから明確に導けるarXiv/PMCのPDFだけに限定する。paywall回避や認証回避には使わない。
 - Semantic Scholar API keyは任意の環境変数`SEMANTIC_SCHOLAR_API_KEY`だけを使う。API keyを`metadata.yaml`、`idea_notes.md`、ログへ書かない。
 - `paper.md`は必ず`paper.pdf`から変換して作る。`paper.pdf`を保存できない場合、PMC XML、HTML、abstract、publisher本文、API本文から`paper.md`だけを作らない。
+- すべてのPDF取得候補に失敗した場合は、ユーザーに聞かれる前に、手動で確認すべきURLと`paper.pdf`の保存先を`idea_notes.md`と最終応答に明記する。
 - 公開repositoryのsource code本体はworkspaceへclone保存しない。
 - `code_url`がある場合は、`gitingest` Python APIへURLを直接渡し、`source.md`だけを作成する。
 - source ingestのファイルサイズ上限は、wrapper側の一時コピーではなく、`gitingest.ingest(..., max_file_size=100 * 1024)`で指定する。
@@ -151,7 +175,13 @@ uv run python .agents/skills/01-prior-research/scripts/download_prior_research.p
 ```
 
 このscriptは`metadata.yaml`の`pdf_url`と`code_url`を読み、公開PDFを取得し、`code_url`はcloneせず`gitingest` Python APIで`source.md`へ直接変換する。取得だけに止めたい場合だけ`--no-ingest`を付ける。ただしsource code本体は保存しないため、`--no-ingest`時は`code_url`から`source.md`も作成しない。
-`paper.pdf`を保存できない場合はSemantic Scholar `openAccessPdf`をフォールバックとして確認し、成功した場合だけ`metadata.yaml`の`pdf_url`と`access_note`を更新する。取得できない理由は`idea_notes.md`に記録し、`paper.md`は作成しない。
+`paper.pdf`を保存できない場合は、PMC Free Full Textの公開PDFを先に確認し、それでも取得できない場合にSemantic Scholar `openAccessPdf`を確認する。成功した場合だけ`metadata.yaml`の`pdf_url`、`pmcid`、`access_note`を更新する。取得できない理由は`idea_notes.md`に記録し、`paper.md`は作成しない。未取得のまま残る場合は、手動PDF取得候補URLと保存先を必ず出す。
+
+複数の先行研究をまとめて取得した後、未取得PDFが1件でもある場合は、最終応答に次の表を含める。
+
+```text
+paper_id | 手動確認URL | 保存先
+```
 
 # ingest
 
