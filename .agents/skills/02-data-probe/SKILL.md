@@ -42,6 +42,26 @@ discovery_state/hypothesis_bank.md
 - API key、login、tokenが必要な場合は人間に確認する。
 - probe結果だけで最終結論を出さない。
 
+# 曖昧な呼び出しへの対応
+
+ユーザーが`$data-probe`、`02-data-probe`、`data-probe`のようにskill名だけを指定し、対象仮説、確認したい問い、データソースを書いていない場合:
+
+- skillの中身やファイル構造を説明しない。
+- 「skillを確認しました」「以後この形式に従います」のような確認報告だけで終わらない。
+- 次に何を確認したいかを短く聞く。
+- 候補を出す場合も、次の選択肢だけを簡潔に示す。
+
+返答例:
+
+```text
+data-probeで何を確認しますか？
+
+- 特定仮説に必要な公開データの有無
+- データ形式やサイズ
+- 利用制限
+- 小さな再現用probeの作成
+```
+
 # 使ってよい対象
 
 - Web検索
@@ -76,7 +96,7 @@ discovery_state/hypothesis_bank.md
 helper scriptを使う場合:
 
 ```bash
-python .agents/skills/02-data-probe/scripts/init_probe.py <probe_id>
+uv run python .agents/skills/02-data-probe/scripts/init_probe.py <probe_id>
 ```
 
 # data/README.md更新

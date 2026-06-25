@@ -1,0 +1,9 @@
+[project]
+name = "idea-discovery-workspace"
+version = "0.1.0"
+description = "Local Codex and Markdown workspace for research idea discovery."
+requires-python = ">=3.12"
+dependencies = [
+    "gitingest",
+    "pymupdf4llm",
+]

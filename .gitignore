@@ -20,6 +20,7 @@ venv/
 # Local/generated workspace runs
 example_project/
 example_project_pathology/
+example_perturbation/
 data/*
 !data/README.md
 probes/*

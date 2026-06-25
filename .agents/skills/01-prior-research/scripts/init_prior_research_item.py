@@ -85,8 +85,7 @@ def main() -> int:
 
     root = Path(args.root).expanduser().resolve()
     item_dir = root / "prior_research" / args.name
-    source_dir = item_dir / "source"
-    source_dir.mkdir(parents=True, exist_ok=True)
+    item_dir.mkdir(parents=True, exist_ok=True)
 
     messages = [
         write_file(item_dir / "metadata.yaml", METADATA_TEMPLATE, args.force),
@@ -94,7 +93,6 @@ def main() -> int:
     ]
 
     print(f"先行研究アイテムを作成: {item_dir}")
-    print(f"sourceディレクトリを作成: {source_dir}")
     for message in messages:
         print(message)
     print(f"作成日時: {utc_now()}")

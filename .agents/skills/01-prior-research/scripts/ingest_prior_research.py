@@ -4,23 +4,42 @@
 from __future__ import annotations
 
 import argparse
-import shutil
-import subprocess
-import tempfile
+import os
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
 
 MAX_SOURCE_FILE_BYTES = 100 * 1024
-IGNORED_DIR_NAMES = {".git", "__pycache__", ".ipynb_checkpoints"}
+PDF_IMAGE_DIR_NAME = "figures"
+DIRECT_PYTHON_OVERRIDE_ENV = "IDEA_DISCOVERY_ALLOW_DIRECT_PYTHON"
+SCRIPT_RELATIVE_PATH = ".agents/skills/01-prior-research/scripts/ingest_prior_research.py"
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def format_bytes(size: int) -> str:
-    return f"{size / 1024:.1f}KB"
+def running_under_uv() -> bool:
+    return bool(os.environ.get("UV_RUN_RECURSION_DEPTH"))
+
+
+def require_uv_run(script_relative_path: str) -> None:
+    if os.environ.get(DIRECT_PYTHON_OVERRIDE_ENV) == "1":
+        return
+    if running_under_uv():
+        return
+
+    raise SystemExit(
+        "\n".join(
+            [
+                "このscriptはuv経由で実行してください。",
+                f"例: uv run python {script_relative_path} <prior_research_dir>",
+                "`python ...`や`python3 ...`の直呼びは、.venv外のPythonを使い依存不足を起こすため停止しました。",
+                f"一時的に直呼びを許可する場合だけ、{DIRECT_PYTHON_OVERRIDE_ENV}=1を明示してください。",
+            ]
+        )
+    )
 
 
 def write_text(path: Path, text: str, force: bool) -> str:
@@ -65,6 +84,18 @@ def update_metadata_value(metadata_path: Path, key: str, value: str) -> str:
     return f"metadata.yamlの{key}を更新した"
 
 
+def read_metadata_value(metadata_path: Path, key: str) -> str:
+    if not metadata_path.exists():
+        return ""
+    for line in metadata_path.read_text(encoding="utf-8").splitlines():
+        if ":" not in line or line.lstrip().startswith("#"):
+            continue
+        existing_key, value = line.split(":", 1)
+        if existing_key.strip() == key:
+            return value.strip().strip('"').strip("'")
+    return ""
+
+
 def append_ingest_log(item_dir: Path, messages: list[str]) -> None:
     notes_path = item_dir / "idea_notes.md"
     if notes_path.exists():
@@ -79,6 +110,16 @@ def append_ingest_log(item_dir: Path, messages: list[str]) -> None:
     append_text(notes_path, heading + entry)
 
 
+@contextmanager
+def working_directory(path: Path):
+    previous_cwd = Path.cwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(previous_cwd)
+
+
 def ingest_pdf(item_dir: Path, force: bool) -> str:
     pdf_path = item_dir / "paper.pdf"
     out_path = item_dir / "paper.md"
@@ -90,68 +131,28 @@ def ingest_pdf(item_dir: Path, force: bool) -> str:
     try:
         markdown = pdf_to_markdown(pdf_path)
     except ImportError:
-        return "pymupdf4llm/PyMuPDFが未導入のためPDF変換をスキップした。paper.mdを手動作成してもよい"
+        return "pymupdf4llmが未導入のためPDF変換をスキップした。別方式のfallbackは追加せず、人間に導入または手動作成を確認する"
     except Exception as error:  # noqa: BLE001
         return f"PDF変換をスキップした: {error}"
 
     header = f"<!-- paper.pdfから{utc_now()}に変換 -->\n\n"
-    return write_text(out_path, header + markdown, force=True)
+    write_message = write_text(out_path, header + markdown, force=True)
+    return f"{write_message}; PDF内画像の保存先: {PDF_IMAGE_DIR_NAME}/"
 
 
 def pdf_to_markdown(pdf_path: Path) -> str:
-    try:
-        import pymupdf4llm  # type: ignore[import-not-found]
-    except ImportError:
-        return pdf_to_markdown_with_pymupdf(pdf_path)
+    import pymupdf4llm  # type: ignore[import-not-found]
 
-    return pymupdf4llm.to_markdown(str(pdf_path))
-
-
-def pdf_to_markdown_with_pymupdf(pdf_path: Path) -> str:
-    try:
-        import fitz  # type: ignore[import-not-found]
-    except ImportError as error:
-        raise ImportError from error
-
-    sections: list[str] = [f"# {pdf_path.parent.name}"]
-    with fitz.open(pdf_path) as document:
-        for index, page in enumerate(document, start=1):
-            text = page.get_text("text").strip()
-            if text:
-                sections.append(f"## Page {index}\n\n{text}")
-
-    return "\n\n".join(sections)
-
-
-def should_skip_source_path(path: Path) -> bool:
-    return any(part in IGNORED_DIR_NAMES for part in path.parts)
-
-
-def prepare_small_source_tree(source_dir: Path, filtered_dir: Path) -> tuple[int, list[str]]:
-    copied_count = 0
-    skipped_messages: list[str] = []
-
-    for path in sorted(source_dir.rglob("*")):
-        if not path.is_file():
-            continue
-
-        relative_path = path.relative_to(source_dir)
-        if should_skip_source_path(relative_path):
-            continue
-
-        file_size = path.stat().st_size
-        if file_size > MAX_SOURCE_FILE_BYTES:
-            skipped_messages.append(
-                f"source/{relative_path}は{format_bytes(file_size)}で100KBを超えるためスキップした"
-            )
-            continue
-
-        destination = filtered_dir / relative_path
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(path, destination)
-        copied_count += 1
-
-    return copied_count, skipped_messages
+    image_dir = pdf_path.parent / PDF_IMAGE_DIR_NAME
+    image_dir.mkdir(parents=True, exist_ok=True)
+    with working_directory(pdf_path.parent):
+        return pymupdf4llm.to_markdown(
+            pdf_path.name,
+            write_images=True,
+            image_path=PDF_IMAGE_DIR_NAME,
+            image_format="png",
+            dpi=200,
+        )
 
 
 def format_gitingest_result(result: object) -> str:
@@ -168,83 +169,104 @@ def format_gitingest_result(result: object) -> str:
     return str(result)
 
 
-def ingest_source_with_python_api(source_dir: Path) -> str | None:
+def ingest_source_with_python_api(source: str) -> str | None:
     try:
         from gitingest import ingest  # type: ignore[import-not-found]
     except ImportError:
         return None
 
-    result = ingest(str(source_dir))
+    result = ingest(source, max_file_size=MAX_SOURCE_FILE_BYTES)
     return format_gitingest_result(result)
 
 
-def ingest_source_with_cli(source_dir: Path) -> str | None:
-    executable = shutil.which("gitingest")
-    if executable is None:
-        return None
+def source_markdown_header(source_label: str) -> str:
+    return (
+        f"<!-- {source_label}から{utc_now()}にgitingestで変換 -->\n"
+        f"<!-- gitingest max_file_size: 100KB; source code本体は保存しない -->\n\n"
+    )
 
-    with tempfile.TemporaryDirectory(prefix="idea_discovery_gitingest_") as temp_dir:
-        out_path = Path(temp_dir) / "source.md"
-        commands = [
-            [executable, str(source_dir), "-o", str(out_path)],
-            [executable, str(source_dir), "--output", str(out_path)],
-        ]
-        for command in commands:
-            completed = subprocess.run(command, text=True, capture_output=True, check=False)
-            if completed.returncode == 0 and out_path.exists():
-                return out_path.read_text(encoding="utf-8")
-    return None
+
+def write_source_markdown(out_path: Path, markdown: str, source_label: str) -> str:
+    return write_text(out_path, source_markdown_header(source_label) + markdown, force=True)
+
+
+def looks_sensitive_source(value: str) -> bool:
+    lowered = value.lower()
+    return (
+        "@" in value
+        or "token=" in lowered
+        or "access_token=" in lowered
+        or "apikey=" in lowered
+        or "api_key=" in lowered
+        or "private" in lowered
+    )
+
+
+def is_http_url(value: str) -> bool:
+    return value.startswith("https://") or value.startswith("http://")
+
+
+def ingest_source_url(item_dir: Path, code_url: str, force: bool) -> list[str]:
+    out_path = item_dir / "source.md"
+    if not code_url:
+        return ["code_urlが空のためsource.md作成をスキップした"]
+    if looks_sensitive_source(code_url):
+        return ["code_urlに認証情報・token・privateを示す文字列があるためsource.md作成を停止した"]
+    if not is_http_url(code_url):
+        return [f"code_urlがHTTP(S)ではないためsource.md作成をスキップした: {code_url}"]
+    if out_path.exists() and not force:
+        return [f"既存のsource.mdを保持した: {out_path}"]
+
+    try:
+        markdown = ingest_source_with_python_api(code_url)
+    except Exception as error:  # noqa: BLE001
+        return [f"gitingest Python APIでのcode_url変換をスキップした: {error}"]
+
+    if markdown is None:
+        return ["gitingestが未導入のためcode_url変換をスキップした。別方式のfallbackは追加せず、人間に導入または手動作成を確認する"]
+
+    return [write_source_markdown(out_path, markdown, code_url)]
 
 
 def ingest_source(item_dir: Path, force: bool) -> list[str]:
     source_dir = item_dir / "source"
     out_path = item_dir / "source.md"
     if not source_dir.exists():
-        return [f"sourceディレクトリが存在しないためコード変換をスキップした: {source_dir}"]
+        return [f"sourceディレクトリが存在しないためローカルsource変換をスキップした: {source_dir}"]
     if out_path.exists() and not force:
         return [f"既存のsource.mdを保持した: {out_path}"]
 
-    with tempfile.TemporaryDirectory(prefix="idea_discovery_source_") as temp_dir:
-        filtered_dir = Path(temp_dir) / "source"
-        copied_count, skipped_messages = prepare_small_source_tree(source_dir, filtered_dir)
-
-        if copied_count == 0:
-            messages = ["100KB以下のsourceファイルが見つからないためコード変換をスキップした"]
-            messages.extend(skipped_messages)
-            return messages
-
-        try:
-            markdown = ingest_source_with_python_api(filtered_dir)
-        except Exception as error:  # noqa: BLE001
-            messages = [f"Python APIでのコード変換をスキップした: {error}"]
-            messages.extend(skipped_messages)
-            return messages
-
-        if markdown is None:
-            try:
-                markdown = ingest_source_with_cli(filtered_dir)
-            except Exception as error:  # noqa: BLE001
-                messages = [f"CLIでのコード変換をスキップした: {error}"]
-                messages.extend(skipped_messages)
-                return messages
+    try:
+        markdown = ingest_source_with_python_api(str(source_dir))
+    except Exception as error:  # noqa: BLE001
+        return [f"gitingest Python APIでのローカルsource変換をスキップした: {error}"]
 
     if markdown is None:
-        messages = ["gitingestが未導入のためコード変換をスキップした。source.mdを手動作成してもよい"]
-        messages.extend(skipped_messages)
-        return messages
+        return ["gitingestが未導入のためローカルsource変換をスキップした。別方式のfallbackは追加せず、人間に導入または手動作成を確認する"]
 
-    header = (
-        f"<!-- source/から{utc_now()}に変換 -->\n"
-        f"<!-- 対象ファイル数: {copied_count}; 1ファイル上限: 100KB -->\n\n"
-    )
-    messages = [write_text(out_path, header + markdown, force=True)]
-    messages.extend(skipped_messages)
-    return messages
+    return [write_source_markdown(out_path, markdown, "source/")]
 
 
-def ingest_prior_research(item_dir: Path, force: bool) -> list[str]:
-    messages = [ingest_pdf(item_dir, force)]
-    messages.extend(ingest_source(item_dir, force))
+def ingest_prior_research(
+    item_dir: Path,
+    force: bool,
+    pdf_only: bool = False,
+    source_only: bool = False,
+    source_url: str = "",
+) -> list[str]:
+    if pdf_only and source_only:
+        raise ValueError("pdf_only and source_only cannot both be true")
+
+    messages: list[str] = []
+    if not source_only:
+        messages.append(ingest_pdf(item_dir, force))
+    if not pdf_only:
+        if not source_url:
+            source_url = read_metadata_value(item_dir / "metadata.yaml", "code_url")
+        if source_url:
+            messages.extend(ingest_source_url(item_dir, source_url, force))
+        else:
+            messages.extend(ingest_source(item_dir, force))
     messages.append(update_metadata_value(item_dir / "metadata.yaml", "ingested_at", utc_now()))
     append_ingest_log(item_dir, messages)
     return messages
@@ -258,7 +280,13 @@ def main() -> int:
         action="store_true",
         help="Overwrite existing paper.md or source.md.",
     )
+    parser.add_argument("--pdf-only", action="store_true", help="Only convert paper.pdf to paper.md.")
+    parser.add_argument("--source-only", action="store_true", help="Only create source.md from metadata code_url or local source/.")
     args = parser.parse_args()
+
+    if args.pdf_only and args.source_only:
+        parser.error("--pdf-only and --source-only cannot be used together")
+    require_uv_run(SCRIPT_RELATIVE_PATH)
 
     item_dir = Path(args.item_dir).expanduser().resolve()
     if not item_dir.exists():
@@ -266,7 +294,7 @@ def main() -> int:
     if not item_dir.is_dir():
         parser.error(f"item_dirはディレクトリではありません: {item_dir}")
 
-    messages = ingest_prior_research(item_dir, args.force)
+    messages = ingest_prior_research(item_dir, args.force, args.pdf_only, args.source_only)
     for message in messages:
         print(message)
     return 0

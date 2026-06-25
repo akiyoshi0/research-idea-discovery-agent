@@ -1,27 +1,54 @@
 #!/usr/bin/env python3
-"""Download public prior-research PDF/code listed in metadata.yaml."""
+"""Download prior-research PDF and create Markdown artifacts listed in metadata.yaml."""
 
 from __future__ import annotations
 
 import argparse
+import importlib.util
+import json
+import os
 import re
 import shutil
 import subprocess
 import ssl
-import textwrap
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse
-from xml.etree import ElementTree
+from urllib.parse import quote, urlparse
 
 
 USER_AGENT = "IdeaDiscoveryWorkspace/0.1"
+SEMANTIC_SCHOLAR_API_ROOT = "https://api.semanticscholar.org/graph/v1"
+SEMANTIC_SCHOLAR_FIELDS = "title,externalIds,openAccessPdf,isOpenAccess,url"
+DIRECT_PYTHON_OVERRIDE_ENV = "IDEA_DISCOVERY_ALLOW_DIRECT_PYTHON"
+SCRIPT_RELATIVE_PATH = ".agents/skills/01-prior-research/scripts/download_prior_research.py"
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def running_under_uv() -> bool:
+    return bool(os.environ.get("UV_RUN_RECURSION_DEPTH"))
+
+
+def require_uv_run(script_relative_path: str) -> None:
+    if os.environ.get(DIRECT_PYTHON_OVERRIDE_ENV) == "1":
+        return
+    if running_under_uv():
+        return
+
+    raise SystemExit(
+        "\n".join(
+            [
+                "このscriptはuv経由で実行してください。",
+                f"例: uv run python {script_relative_path} prior_research/<paper_id>",
+                "`python ...`や`python3 ...`の直呼びは、.venv外のPythonを使い依存不足を起こすため停止しました。",
+                f"一時的に直呼びを許可する場合だけ、{DIRECT_PYTHON_OVERRIDE_ENV}=1を明示してください。",
+            ]
+        )
+    )
 
 
 def read_simple_metadata(metadata_path: Path) -> dict[str, str]:
@@ -35,6 +62,46 @@ def read_simple_metadata(metadata_path: Path) -> dict[str, str]:
         key, value = line.split(":", 1)
         metadata[key.strip()] = value.strip().strip('"').strip("'")
     return metadata
+
+
+def yaml_quote(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def update_metadata_value(metadata_path: Path, key: str, value: str) -> str:
+    line = f"{key}: {yaml_quote(value)}"
+
+    if not metadata_path.exists():
+        metadata_path.write_text(line + "\n", encoding="utf-8")
+        return f"metadata.yamlを作成し、{key}を設定した"
+
+    lines = metadata_path.read_text(encoding="utf-8").splitlines()
+    updated: list[str] = []
+    replaced = False
+
+    for existing_line in lines:
+        if existing_line.startswith(f"{key}:"):
+            updated.append(line)
+            replaced = True
+        else:
+            updated.append(existing_line)
+
+    if not replaced:
+        updated.append(line)
+
+    metadata_path.write_text("\n".join(updated) + "\n", encoding="utf-8")
+    return f"metadata.yamlの{key}を更新した"
+
+
+def append_metadata_note(metadata_path: Path, key: str, note: str) -> str:
+    metadata = read_simple_metadata(metadata_path)
+    current = metadata.get(key, "")
+    if note in current:
+        return f"metadata.yamlの{key}は既にSemantic Scholar取得元を含む"
+
+    value = note if not current else f"{current}; {note}"
+    return update_metadata_value(metadata_path, key, value)
 
 
 def append_text(path: Path, text: str) -> None:
@@ -55,7 +122,7 @@ def append_fetch_log(item_dir: Path, messages: list[str]) -> None:
     else:
         heading = "# アイデアメモ\n\n## 取得・変換ログ\n"
 
-    entry = f"\n- {utc_now()}: `{item_dir.name}`の公開PDF/source取得を実行した\n"
+    entry = f"\n- {utc_now()}: `{item_dir.name}`の公開PDF取得・source.md作成処理を実行した\n"
     entry += "".join(f"  - {message}\n" for message in messages)
     append_text(notes_path, heading + entry)
 
@@ -84,6 +151,234 @@ def is_likely_pdf(data: bytes, content_type: str) -> bool:
     if "pdf" in content_type.lower() and b"<html" not in head:
         return True
     return False
+
+
+def normalize_doi(value: str) -> str:
+    value = value.strip()
+    value = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"^doi:\s*", "", value, flags=re.IGNORECASE)
+    return value.strip()
+
+
+def extract_arxiv_id(*values: str) -> str:
+    for value in values:
+        if not value:
+            continue
+        patterns = [
+            r"arxiv\.org/(?:abs|pdf)/([^?#\s]+)",
+            r"arxiv[:.]\s*([A-Za-z0-9._/-]+)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, value, flags=re.IGNORECASE)
+            if not match:
+                continue
+            arxiv_id = match.group(1).strip().rstrip("/")
+            arxiv_id = re.sub(r"\.pdf$", "", arxiv_id, flags=re.IGNORECASE)
+            return arxiv_id
+    return ""
+
+
+def extract_semantic_scholar_id(*values: str) -> str:
+    for value in values:
+        if not value:
+            continue
+        if re.fullmatch(r"[a-f0-9]{40}", value.strip(), flags=re.IGNORECASE):
+            return value.strip()
+        if value.strip().isdigit():
+            return f"CorpusId:{value.strip()}"
+        match = re.search(
+            r"semanticscholar\.org/paper/(?:[^/?#]+/)?([a-f0-9]{40})",
+            value,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            return match.group(1)
+    return ""
+
+
+def normalize_title(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip().rstrip(".").casefold()
+
+
+def semantic_scholar_headers() -> dict[str, str]:
+    headers = {"User-Agent": USER_AGENT}
+    api_key = os.environ.get("SEMANTIC_SCHOLAR_API_KEY", "").strip()
+    if api_key:
+        headers["x-api-key"] = api_key
+    return headers
+
+
+def fetch_semantic_scholar_json(url: str) -> tuple[dict[str, object] | None, str]:
+    request = urllib.request.Request(url, headers=semantic_scholar_headers())
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            data = response.read()
+    except urllib.error.HTTPError as error:
+        if error.code in {401, 403, 407, 429}:
+            return None, f"Semantic Scholar取得を停止した: HTTP {error.code}。認証、rate limit、またはアクセス制限の可能性がある"
+        if error.code == 404:
+            return None, "Semantic Scholarに該当paperが見つからなかった: HTTP 404"
+        return None, f"Semantic Scholar取得に失敗した: HTTP {error.code}"
+    except Exception as error:  # noqa: BLE001
+        return None, f"Semantic Scholar取得に失敗した: {error}"
+
+    try:
+        parsed = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        return None, f"Semantic Scholar API応答をJSONとして読めなかった: {error}"
+
+    if not isinstance(parsed, dict):
+        return None, "Semantic Scholar API応答がJSON objectではないためスキップした"
+    if "message" in parsed and not parsed.get("paperId") and not parsed.get("data"):
+        return None, f"Semantic Scholar APIがエラーを返した: {parsed.get('message')}"
+    return parsed, "Semantic Scholar API応答を取得した"
+
+
+def semantic_scholar_identifiers(metadata: dict[str, str]) -> list[tuple[str, str]]:
+    identifiers: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    doi = normalize_doi(metadata.get("doi", ""))
+    if doi:
+        identifiers.append(("DOI", f"DOI:{doi}"))
+
+    arxiv_id = extract_arxiv_id(
+        metadata.get("doi", ""),
+        metadata.get("paper_url", ""),
+        metadata.get("pdf_url", ""),
+    )
+    if arxiv_id:
+        identifiers.append(("arXiv", f"arXiv:{arxiv_id}"))
+
+    semantic_scholar_id = extract_semantic_scholar_id(
+        metadata.get("semantic_scholar_id", ""),
+        metadata.get("semantic_scholar_paper_id", ""),
+        metadata.get("paper_id", ""),
+        metadata.get("paper_url", ""),
+        metadata.get("pdf_url", ""),
+    )
+    if semantic_scholar_id:
+        identifiers.append(("Semantic Scholar paperId", semantic_scholar_id))
+
+    deduped: list[tuple[str, str]] = []
+    for label, identifier in identifiers:
+        if identifier in seen:
+            continue
+        seen.add(identifier)
+        deduped.append((label, identifier))
+    return deduped
+
+
+def query_semantic_scholar_by_identifier(identifier: str) -> tuple[dict[str, object] | None, str]:
+    encoded_identifier = quote(identifier, safe=":")
+    url = f"{SEMANTIC_SCHOLAR_API_ROOT}/paper/{encoded_identifier}?fields={SEMANTIC_SCHOLAR_FIELDS}"
+    return fetch_semantic_scholar_json(url)
+
+
+def query_semantic_scholar_by_title(title: str) -> tuple[dict[str, object] | None, str]:
+    normalized = normalize_title(title)
+    if not normalized:
+        return None, "titleが空のためSemantic Scholar title検索をスキップした"
+
+    encoded_query = quote(title)
+    url = (
+        f"{SEMANTIC_SCHOLAR_API_ROOT}/paper/search"
+        f"?query={encoded_query}&limit=5&fields={SEMANTIC_SCHOLAR_FIELDS}"
+    )
+    payload, message = fetch_semantic_scholar_json(url)
+    if payload is None:
+        return None, message
+
+    data = payload.get("data")
+    if not isinstance(data, list):
+        return None, "Semantic Scholar title検索応答にdata配列がないためスキップした"
+
+    for candidate in data:
+        if not isinstance(candidate, dict):
+            continue
+        candidate_title = candidate.get("title")
+        if isinstance(candidate_title, str) and normalize_title(candidate_title) == normalized:
+            return candidate, f"Semantic Scholar title検索で完全一致候補を取得した: {candidate_title}"
+
+    return None, "Semantic Scholar title検索に完全一致がないためPDF取得をスキップした"
+
+
+def query_semantic_scholar(metadata: dict[str, str]) -> tuple[dict[str, object] | None, list[str]]:
+    messages: list[str] = []
+    for label, identifier in semantic_scholar_identifiers(metadata):
+        payload, message = query_semantic_scholar_by_identifier(identifier)
+        messages.append(f"{label}でSemantic Scholarを照会した: {message}")
+        if payload is not None:
+            title = payload.get("title")
+            if isinstance(title, str) and title:
+                messages.append(f"Semantic Scholar候補を取得した: {title}")
+            return payload, messages
+
+    title = metadata.get("title", "")
+    if title:
+        payload, message = query_semantic_scholar_by_title(title)
+        messages.append(message)
+        if payload is not None:
+            return payload, messages
+
+    if not messages:
+        messages.append("Semantic Scholar検索に使えるDOI、arXiv ID、paperId、titleがないためスキップした")
+    return None, messages
+
+
+def normalize_open_access_pdf_url(url: str) -> str:
+    if not url:
+        return ""
+    parsed = urlparse(url)
+    path = parsed.path.lower()
+    if path.endswith(".pdf") or "/pdf" in path:
+        return url
+
+    arxiv_id = extract_arxiv_id(url)
+    if arxiv_id:
+        return f"https://arxiv.org/pdf/{arxiv_id}"
+
+    pmcid = extract_pmcid(url)
+    if pmcid:
+        return f"https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/pdf/"
+
+    return ""
+
+
+def semantic_scholar_pdf_candidates(paper: dict[str, object]) -> tuple[list[str], str]:
+    open_access_pdf = paper.get("openAccessPdf")
+    if not isinstance(open_access_pdf, dict):
+        return [], "Semantic ScholarにopenAccessPdfがないためPDF候補を取得できなかった"
+
+    pdf_url = open_access_pdf.get("url")
+    if not isinstance(pdf_url, str) or not pdf_url.strip():
+        return [], "Semantic Scholar openAccessPdf.urlが空のためPDF候補を取得できなかった"
+
+    candidates: list[str] = []
+    for candidate in [pdf_url.strip(), normalize_open_access_pdf_url(pdf_url.strip())]:
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    status = open_access_pdf.get("status")
+    status_text = f"; OA status={status}" if status else ""
+    return candidates, f"Semantic Scholar openAccessPdfからPDF候補を取得した{status_text}"
+
+
+def semantic_scholar_access_note(paper: dict[str, object], pdf_url: str) -> str:
+    parts = [f"Semantic Scholar openAccessPdf経由で取得: {pdf_url}"]
+    paper_url = paper.get("url")
+    if isinstance(paper_url, str) and paper_url:
+        parts.append(f"Semantic Scholar paper URL={paper_url}")
+
+    open_access_pdf = paper.get("openAccessPdf")
+    if isinstance(open_access_pdf, dict):
+        status = open_access_pdf.get("status")
+        license_value = open_access_pdf.get("license")
+        if status:
+            parts.append(f"OA status={status}")
+        if license_value:
+            parts.append(f"license={license_value}")
+    return "; ".join(parts)
 
 
 def download_pdf(pdf_url: str, destination: Path, force: bool) -> str:
@@ -152,48 +447,117 @@ def download_pdf_with_curl(pdf_url: str) -> bytes | str:
     return completed.stdout
 
 
-def clone_public_code(code_url: str, destination: Path, force: bool) -> str:
-    if not code_url:
-        return "code_urlが空のためsource取得をスキップした"
-    if looks_sensitive_url(code_url):
-        return "code_urlに認証情報・token・privateを示す文字列があるためsource取得を停止した"
-    if not is_http_url(code_url):
-        return f"code_urlがHTTP(S)ではないためsource取得をスキップした: {code_url}"
-    if destination.exists() and any(destination.iterdir()) and not force:
-        return f"既存のsource/を保持した: {destination}"
-    if destination.exists() and force:
-        shutil.rmtree(destination)
+def download_semantic_scholar_pdf(
+    metadata: dict[str, str],
+    metadata_path: Path,
+    destination: Path,
+    force: bool,
+) -> list[str]:
+    messages = ["Semantic Scholar openAccessPdfによるPDF取得を試行した"]
+    paper, query_messages = query_semantic_scholar(metadata)
+    messages.extend(query_messages)
+    if paper is None:
+        return messages
 
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    command = ["git", "clone", "--depth", "1", code_url, str(destination)]
-    try:
-        completed = subprocess.run(command, text=True, capture_output=True, check=False)
-    except FileNotFoundError:
-        return "gitコマンドが見つからないためsource取得に失敗した"
+    candidates, candidate_message = semantic_scholar_pdf_candidates(paper)
+    messages.append(candidate_message)
+    if not candidates:
+        return messages
 
-    if completed.returncode != 0:
-        message = completed.stderr.strip() or completed.stdout.strip()
-        return f"source取得に失敗した: {message}"
+    for candidate_url in candidates:
+        if looks_sensitive_url(candidate_url):
+            messages.append("Semantic Scholar候補URLに認証情報・token・privateを示す文字列があるためPDF保存を停止した")
+            continue
+        if not is_http_url(candidate_url):
+            messages.append(f"Semantic Scholar候補URLがHTTP(S)ではないためスキップした: {candidate_url}")
+            continue
 
-    return f"sourceを取得した: {destination}"
+        pdf_message = download_pdf(candidate_url, destination, force)
+        messages.append(f"Semantic Scholar候補PDFの取得結果: {pdf_message}")
+        if destination.exists():
+            messages.append(update_metadata_value(metadata_path, "pdf_url", candidate_url))
+            access_note = semantic_scholar_access_note(paper, candidate_url)
+            messages.append(append_metadata_note(metadata_path, "access_note", access_note))
+            return messages
+
+    messages.append("Semantic Scholar候補からpaper.pdfを保存できなかった")
+    return messages
 
 
-def download_prior_research(item_dir: Path, force: bool, pdf_only: bool, code_only: bool) -> list[str]:
-    metadata = read_simple_metadata(item_dir / "metadata.yaml")
+def load_ingest_module() -> object:
+    script_path = Path(__file__).with_name("ingest_prior_research.py")
+    spec = importlib.util.spec_from_file_location("ingest_prior_research", script_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"ingest scriptを読み込めない: {script_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def run_ingest_after_download(
+    item_dir: Path,
+    force: bool,
+    pdf_only: bool,
+    code_only: bool,
+    source_url: str = "",
+) -> list[str]:
+    module = load_ingest_module()
+    ingest_prior_research = getattr(module, "ingest_prior_research")
+    ingest_messages = ingest_prior_research(
+        item_dir,
+        force,
+        pdf_only=pdf_only,
+        source_only=code_only,
+        source_url=source_url,
+    )
+    return [f"Markdown化: {message}" for message in ingest_messages]
+
+
+def download_prior_research(
+    item_dir: Path,
+    force: bool,
+    pdf_only: bool,
+    code_only: bool,
+    ingest_after_download: bool = True,
+) -> list[str]:
+    metadata_path = item_dir / "metadata.yaml"
+    metadata = read_simple_metadata(metadata_path)
     pdf_url = metadata.get("pdf_url", "")
-    paper_url = metadata.get("paper_url", "")
     code_url = metadata.get("code_url", "")
+    pdf_path = item_dir / "paper.pdf"
 
     messages: list[str] = []
     if not code_only:
-        pdf_message = download_pdf(pdf_url, item_dir / "paper.pdf", force)
+        pdf_message = download_pdf(pdf_url, pdf_path, force)
         messages.append(pdf_message)
-        if not (item_dir / "paper.pdf").exists():
-            messages.append(download_pmc_markdown(paper_url or pdf_url, item_dir / "paper.md", force))
+        if not pdf_path.exists():
+            semantic_scholar_messages = download_semantic_scholar_pdf(
+                metadata,
+                metadata_path,
+                pdf_path,
+                force,
+            )
+            messages.extend(semantic_scholar_messages)
+        if not pdf_path.exists():
+            messages.append("paper.pdfを保存できなかったためpaper.mdは作成しない。paper.mdは必ずpaper.pdfから変換する")
     if not pdf_only:
-        messages.append(clone_public_code(code_url, item_dir / "source", force))
+        if code_url:
+            if ingest_after_download:
+                messages.append("code_urlはsource/へcloneせず、gitingest Python APIでsource.mdへ直接変換する")
+            else:
+                messages.append("source code本体は保存しない方針のため、--no-ingestではcode_urlからsource.mdを作成しない")
+        else:
+            messages.append("code_urlが空のためsource.md作成をスキップした")
 
     append_fetch_log(item_dir, messages)
+    if ingest_after_download:
+        try:
+            source_url = code_url if not pdf_only else ""
+            messages.extend(run_ingest_after_download(item_dir, force, pdf_only, code_only, source_url=source_url))
+        except Exception as error:  # noqa: BLE001
+            message = f"Markdown化をスキップした: {error}"
+            messages.append(message)
+            append_fetch_log(item_dir, [message])
     return messages
 
 
@@ -202,100 +566,22 @@ def extract_pmcid(url_or_text: str) -> str:
     return match.group(0).upper() if match else ""
 
 
-def download_pmc_markdown(paper_url: str, destination: Path, force: bool) -> str:
-    pmcid = extract_pmcid(paper_url)
-    if not pmcid:
-        return "PMCIDが見つからないためPMC XMLからのpaper.md作成をスキップした"
-    if destination.exists() and not force:
-        return f"既存のpaper.mdを保持した: {destination}"
-
-    xml_url = (
-        "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
-        f"?db=pmc&id={pmcid}&retmode=xml"
-    )
-    request = urllib.request.Request(xml_url, headers={"User-Agent": USER_AGENT})
-    try:
-        with urllib.request.urlopen(request, timeout=45) as response:
-            data = response.read()
-    except Exception as error:  # noqa: BLE001
-        return f"PMC XMLからのpaper.md作成に失敗した: {error}"
-
-    head = data[:512].lower()
-    if b"<html" in head or b"recaptcha" in head:
-        return "PMC XMLではない応答の可能性があるためpaper.mdを作成しなかった"
-
-    try:
-        markdown = pmc_xml_to_markdown(data, pmcid)
-    except Exception as error:  # noqa: BLE001
-        return f"PMC XMLのMarkdown変換に失敗した: {error}"
-
-    destination.write_text(markdown.rstrip() + "\n", encoding="utf-8")
-    return f"PMC XMLからpaper.mdを作成した: {destination}"
-
-
-def clean_inline_text(text: str) -> str:
-    return " ".join(text.split())
-
-
-def element_text(element: ElementTree.Element | None) -> str:
-    if element is None:
-        return ""
-    return clean_inline_text("".join(element.itertext()))
-
-
-def pmc_xml_to_markdown(data: bytes, pmcid: str) -> str:
-    root = ElementTree.fromstring(data)
-    title = element_text(root.find(".//article-title")) or pmcid
-    doi = element_text(root.find(".//article-id[@pub-id-type='doi']"))
-    pmid = element_text(root.find(".//article-id[@pub-id-type='pmid']"))
-    abstract = element_text(root.find(".//abstract"))
-
-    lines = [
-        f"<!-- PMC XMLから{utc_now()}に変換 -->",
-        "",
-        f"# {title}",
-        "",
-        f"- PMCID: {pmcid}",
-    ]
-    if pmid:
-        lines.append(f"- PMID: {pmid}")
-    if doi:
-        lines.append(f"- DOI: {doi}")
-
-    if abstract:
-        lines.extend(["", "## Abstract", "", textwrap.fill(abstract, width=100)])
-
-    body = root.find(".//body")
-    if body is not None:
-        lines.extend(["", "## Body"])
-        for section in body.iter("sec"):
-            heading = element_text(section.find("title"))
-            if heading:
-                lines.extend(["", f"### {heading}"])
-            for paragraph in section.findall("p"):
-                text = element_text(paragraph)
-                if text:
-                    lines.extend(["", textwrap.fill(text, width=100)])
-
-        if not any(line.startswith("### ") for line in lines):
-            for paragraph in body.findall(".//p"):
-                text = element_text(paragraph)
-                if text:
-                    lines.extend(["", textwrap.fill(text, width=100)])
-
-    return "\n".join(lines)
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("item_dir", help="Path such as prior_research/paper_a.")
-    parser.add_argument("--force", action="store_true", help="Overwrite existing paper.pdf or source/.")
+    parser.add_argument("--force", action="store_true", help="Overwrite existing paper.pdf, paper.md, or source.md.")
     parser.add_argument("--pdf-only", action="store_true", help="Only download paper.pdf.")
-    parser.add_argument("--code-only", action="store_true", help="Only clone source/.")
+    parser.add_argument("--code-only", action="store_true", help="Only create source.md from code_url or local source/.")
+    parser.add_argument(
+        "--no-ingest",
+        action="store_true",
+        help="Only download PDF and skip paper.md/source.md conversion. code_url is not cloned.",
+    )
     args = parser.parse_args()
 
     if args.pdf_only and args.code_only:
         parser.error("--pdf-only and --code-only cannot be used together")
+    require_uv_run(SCRIPT_RELATIVE_PATH)
 
     item_dir = Path(args.item_dir).expanduser().resolve()
     if not item_dir.exists():
@@ -303,7 +589,13 @@ def main() -> int:
     if not item_dir.is_dir():
         parser.error(f"item_dirはディレクトリではありません: {item_dir}")
 
-    messages = download_prior_research(item_dir, args.force, args.pdf_only, args.code_only)
+    messages = download_prior_research(
+        item_dir,
+        args.force,
+        args.pdf_only,
+        args.code_only,
+        ingest_after_download=not args.no_ingest,
+    )
     for message in messages:
         print(message)
     return 0
