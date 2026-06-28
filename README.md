@@ -108,6 +108,8 @@ uv run python .agents/skills/02-data-probe/scripts/init_probe.py probe_001_short
 
 `download_prior_research.py`は、PDF取得と`code_url`からの`source.md`直接作成を行い、`paper.md`/`source.md`へのMarkdown化まで一括で実行します。取得だけに止めたい場合は`--no-ingest`を付けます。ただしsource code本体は保存しないため、`--no-ingest`時は`code_url`から`source.md`も作成しません。
 
+PDF取得は、`metadata.yaml`の`pdf_url`を最初に試し、失敗した場合はPMC OA Web Service API、PMC Web PDF候補、Semantic Scholar `openAccessPdf`の順で確認します。PMC OA APIが古い`ftp://ftp.ncbi.nlm.nih.gov/pub/pmc/oa_pdf/...`や`oa_package/...`を返す場合は、PMC FTP Serviceの2026年4月以降の配置に合わせて`https://ftp.ncbi.nlm.nih.gov/pub/pmc/deprecated/...`へ変換します。OA APIのtgz packageしかない場合は、250MB以下のpackageから本文PDFだけを抽出します。
+
 ## 初回セットアップ
 
 PDFやcode_urlをMarkdown化する場合は、最初に`uv`で依存環境を同期してください。
@@ -123,6 +125,7 @@ uv sync
 
 PDF変換時は`pymupdf4llm`の画像保存オプションを使い、論文中の画像を`prior_research/<paper_id>/figures/`へ保存し、`paper.md`内に画像pathを残します。
 `paper.md`は必ず`paper.pdf`から変換して作ります。PDFを保存できない場合は、PMC XML、HTML、abstract、publisher本文、API本文から`paper.md`だけを作りません。
+PMCの通常PDF URLがproof-of-work HTMLやcookie認証、出版社サイトがCloudflare challengeや403を返す場合、その防御は回避しません。取得できなかった場合は、手動確認URLと`paper.pdf`の保存先を`idea_notes.md`と応答に残します。
 公開repositoryのsource code本体はworkspaceへclone保存しません。`metadata.yaml`の`code_url`を`gitingest` Python APIへ直接渡し、`max_file_size=100 * 1024`で1ファイル100KB以下だけを対象にして`source.md`を作ります。`source/`は、人間がローカルsourceを手動配置した場合だけ使います。
 
 未導入の場合は勝手に別ライブラリや内製の簡易変換へfallbackせず、スキップ理由を`idea_notes.md`に記録します。これらがなくても、Markdownファイルを手動で用意すればワークスペースは利用できます。

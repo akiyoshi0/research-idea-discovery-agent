@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import io
 import importlib.util
 import json
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -25,9 +27,18 @@ spec.loader.exec_module(download_prior_research)
 
 
 class FakeResponse:
-    def __init__(self, data: bytes, content_type: str = "", final_url: str = "") -> None:
+    def __init__(
+        self,
+        data: bytes,
+        content_type: str = "",
+        final_url: str = "",
+        content_length: int | None = None,
+    ) -> None:
         self._data = data
+        self._offset = 0
         self.headers = {"Content-Type": content_type}
+        if content_length is not None:
+            self.headers["Content-Length"] = str(content_length)
         self._final_url = final_url
 
     def __enter__(self) -> "FakeResponse":
@@ -36,8 +47,14 @@ class FakeResponse:
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
         return None
 
-    def read(self) -> bytes:
-        return self._data
+    def read(self, size: int = -1) -> bytes:
+        if size is None or size < 0:
+            chunk = self._data[self._offset :]
+            self._offset = len(self._data)
+            return chunk
+        chunk = self._data[self._offset : self._offset + size]
+        self._offset += len(chunk)
+        return chunk
 
     def geturl(self) -> str:
         return self._final_url
@@ -90,6 +107,37 @@ def pmc_idconv_payload(pmcid: str = "", *, pmid: str = "12345678", doi: str = "1
     if pmcid:
         record["pmcid"] = pmcid
     return json.dumps({"status": "ok", "records": [record]}).encode("utf-8")
+
+
+def pmc_oa_payload(
+    pmcid: str,
+    links: list[tuple[str, str]],
+    *,
+    license_value: str = "CC BY",
+) -> bytes:
+    link_text = "".join(f'<link format="{format_value}" href="{href}" />' for format_value, href in links)
+    return (
+        f'<OA><request id="{pmcid}">https://www.ncbi.nlm.nih.gov/pmc/utils/oa/oa.fcgi?id={pmcid}</request>'
+        f'<records returned-count="1" total-count="1"><record id="{pmcid}" citation="Example" '
+        f'license="{license_value}" retracted="no">{link_text}</record></records></OA>'
+    ).encode("utf-8")
+
+
+def pmc_oa_not_open_payload(pmcid: str) -> bytes:
+    return (
+        f"<OA><request>https://www.ncbi.nlm.nih.gov/pmc/utils/oa/oa.fcgi?id={pmcid}</request>"
+        f'<error code="idIsNotOpenAccess">identifier {pmcid!r} is not Open Access</error></OA>'
+    ).encode("utf-8")
+
+
+def make_tgz(files: dict[str, bytes]) -> bytes:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        for name, data in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+    return buffer.getvalue()
 
 
 class DownloadPriorResearchTests(unittest.TestCase):
@@ -240,6 +288,8 @@ class DownloadPriorResearchTests(unittest.TestCase):
                         "application/json",
                         url,
                     )
+                if "pmc/utils/oa/oa.fcgi" in url:
+                    return FakeResponse(pmc_oa_not_open_payload("PMC7572629"), "text/xml", url)
                 if url == "https://pmc.ncbi.nlm.nih.gov/articles/PMC7572629/pdf/":
                     return FakeResponse(b"%PDF-1.4\n", "application/pdf", url)
                 if "api.semanticscholar.org" in url:
@@ -271,6 +321,8 @@ class DownloadPriorResearchTests(unittest.TestCase):
             def route(url: str) -> FakeResponse:
                 if url == "https://publisher.example/paper":
                     return FakeResponse(b"<html>not pdf</html>", "text/html", url)
+                if "pmc/utils/oa/oa.fcgi" in url:
+                    return FakeResponse(pmc_oa_not_open_payload("PMC1234567"), "text/xml", url)
                 if url == "https://pmc.ncbi.nlm.nih.gov/articles/PMC1234567/pdf/":
                     return FakeResponse(b"<html>pmc pdf landing</html>", "text/html", url)
                 if url == "https://pmc.ncbi.nlm.nih.gov/articles/PMC1234567/":
@@ -290,6 +342,218 @@ class DownloadPriorResearchTests(unittest.TestCase):
             metadata = (item_dir / "metadata.yaml").read_text(encoding="utf-8")
             self.assertIn('pmcid: "PMC1234567"', metadata)
             self.assertIn('pdf_url: "https://pmc.ncbi.nlm.nih.gov/articles/PMC1234567/pdf/main.pdf"', metadata)
+
+    def test_pmc_oa_api_pdf_link_is_normalized_to_deprecated_https(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            item_dir = write_item(
+                Path(tmpdir),
+                {
+                    "pmcid": "PMC3531057",
+                    "doi": "10.1093/nar/gks1111",
+                },
+            )
+            normalized_pdf_url = "https://ftp.ncbi.nlm.nih.gov/pub/pmc/deprecated/oa_pdf/f8/10/gks1111.PMC3531057.pdf"
+
+            def route(url: str) -> FakeResponse:
+                if "pmc/utils/oa/oa.fcgi" in url:
+                    return FakeResponse(
+                        pmc_oa_payload(
+                            "PMC3531057",
+                            [("pdf", "ftp://ftp.ncbi.nlm.nih.gov/pub/pmc/oa_pdf/f8/10/gks1111.PMC3531057.pdf")],
+                            license_value="CC BY-NC",
+                        ),
+                        "text/xml",
+                        url,
+                    )
+                if url == normalized_pdf_url:
+                    return FakeResponse(b"%PDF-1.4\n", "application/pdf", url)
+                if "api.semanticscholar.org" in url:
+                    raise AssertionError("Semantic Scholar should not be called after PMC OA PDF success")
+                raise AssertionError(f"unexpected URL: {url}")
+
+            messages, calls = self.run_with_fake_network(item_dir, route)
+
+            self.assertTrue((item_dir / "paper.pdf").exists())
+            self.assertIn(normalized_pdf_url, calls)
+            self.assertFalse(any("api.semanticscholar.org" in call for call in calls))
+            self.assertTrue(any("PMC OA API PDF候補の取得結果" in message for message in messages))
+            metadata = (item_dir / "metadata.yaml").read_text(encoding="utf-8")
+            self.assertIn(f'pdf_url: "{normalized_pdf_url}"', metadata)
+            self.assertIn("PMC OA API経由で取得", metadata)
+            self.assertIn("license=CC BY-NC", metadata)
+
+    def test_pmc_oa_api_tgz_extracts_main_pdf_without_pdf_url_update(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            item_dir = write_item(
+                Path(tmpdir),
+                {
+                    "pmcid": "PMC4967469",
+                    "doi": "10.1016/j.cell.2016.06.017",
+                },
+            )
+            tgz_url = "https://ftp.ncbi.nlm.nih.gov/pub/pmc/deprecated/oa_package/74/87/PMC4967469.tar.gz"
+            tgz_data = make_tgz(
+                {
+                    "PMC4967469/main.pdf": b"%PDF-1.4\nmain",
+                    "PMC4967469/mmc1.pdf": b"%PDF-1.4\nsupplement",
+                }
+            )
+
+            def route(url: str) -> FakeResponse:
+                if "pmc/utils/oa/oa.fcgi" in url:
+                    return FakeResponse(
+                        pmc_oa_payload(
+                            "PMC4967469",
+                            [("tgz", "ftp://ftp.ncbi.nlm.nih.gov/pub/pmc/oa_package/74/87/PMC4967469.tar.gz")],
+                        ),
+                        "text/xml",
+                        url,
+                    )
+                if url == tgz_url:
+                    return FakeResponse(tgz_data, "application/x-gzip", url, content_length=len(tgz_data))
+                if "api.semanticscholar.org" in url:
+                    raise AssertionError("Semantic Scholar should not be called after PMC OA tgz success")
+                raise AssertionError(f"unexpected URL: {url}")
+
+            messages, calls = self.run_with_fake_network(item_dir, route)
+
+            self.assertTrue((item_dir / "paper.pdf").exists())
+            self.assertIn(tgz_url, calls)
+            self.assertTrue(any("main.pdfを本文PDFとして選択した" in message for message in messages))
+            metadata = (item_dir / "metadata.yaml").read_text(encoding="utf-8")
+            self.assertIn('pdf_url: ""', metadata)
+            self.assertIn("package内PDF=PMC4967469/main.pdf", metadata)
+
+    def test_pmc_oa_tgz_over_size_does_not_save_pdf(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            item_dir = write_item(Path(tmpdir), {"pmcid": "PMC9999999", "title": "Example Paper"})
+            tgz_url = "https://ftp.ncbi.nlm.nih.gov/pub/pmc/deprecated/oa_package/aa/bb/PMC9999999.tar.gz"
+
+            def route(url: str) -> FakeResponse:
+                if "pmc/utils/oa/oa.fcgi" in url:
+                    return FakeResponse(
+                        pmc_oa_payload(
+                            "PMC9999999",
+                            [("tgz", "ftp://ftp.ncbi.nlm.nih.gov/pub/pmc/oa_package/aa/bb/PMC9999999.tar.gz")],
+                        ),
+                        "text/xml",
+                        url,
+                    )
+                if url == tgz_url:
+                    return FakeResponse(
+                        b"",
+                        "application/x-gzip",
+                        url,
+                        content_length=download_prior_research.MAX_PMC_OA_TGZ_BYTES + 1,
+                    )
+                if url == "https://pmc.ncbi.nlm.nih.gov/articles/PMC9999999/pdf/":
+                    return FakeResponse(b"<html>not pdf</html>", "text/html", url)
+                if url == "https://pmc.ncbi.nlm.nih.gov/articles/PMC9999999/":
+                    return FakeResponse(b"<html>no pdf</html>", "text/html", url)
+                if "api.semanticscholar.org" in url:
+                    raise HTTPError(url, 429, "Too Many Requests", hdrs=None, fp=None)
+                raise AssertionError(f"unexpected URL: {url}")
+
+            messages, _calls = self.run_with_fake_network(item_dir, route)
+
+            self.assertFalse((item_dir / "paper.pdf").exists())
+            self.assertTrue(any("大きすぎる" in message for message in messages))
+            self.assertTrue(any("手動PDF取得候補URL" in message for message in messages))
+
+    def test_pmc_oa_tgz_supplement_only_does_not_save_pdf(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            item_dir = write_item(Path(tmpdir), {"pmcid": "PMC9999998", "title": "Example Paper"})
+            tgz_url = "https://ftp.ncbi.nlm.nih.gov/pub/pmc/deprecated/oa_package/aa/bb/PMC9999998.tar.gz"
+            tgz_data = make_tgz({"PMC9999998/article-supplement-1.pdf": b"%PDF-1.4\nsupp"})
+
+            def route(url: str) -> FakeResponse:
+                if "pmc/utils/oa/oa.fcgi" in url:
+                    return FakeResponse(
+                        pmc_oa_payload(
+                            "PMC9999998",
+                            [("tgz", "ftp://ftp.ncbi.nlm.nih.gov/pub/pmc/oa_package/aa/bb/PMC9999998.tar.gz")],
+                        ),
+                        "text/xml",
+                        url,
+                    )
+                if url == tgz_url:
+                    return FakeResponse(tgz_data, "application/x-gzip", url, content_length=len(tgz_data))
+                if url == "https://pmc.ncbi.nlm.nih.gov/articles/PMC9999998/pdf/":
+                    return FakeResponse(b"<html>not pdf</html>", "text/html", url)
+                if url == "https://pmc.ncbi.nlm.nih.gov/articles/PMC9999998/":
+                    return FakeResponse(b"<html>no pdf</html>", "text/html", url)
+                if "api.semanticscholar.org" in url:
+                    raise HTTPError(url, 429, "Too Many Requests", hdrs=None, fp=None)
+                raise AssertionError(f"unexpected URL: {url}")
+
+            messages, _calls = self.run_with_fake_network(item_dir, route)
+
+            self.assertFalse((item_dir / "paper.pdf").exists())
+            self.assertTrue(any("補足資料PDFしか" in message for message in messages))
+
+    def test_pmc_oa_tgz_multiple_article_pdfs_is_ambiguous(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            item_dir = write_item(Path(tmpdir), {"pmcid": "PMC9999997", "title": "Example Paper"})
+            tgz_url = "https://ftp.ncbi.nlm.nih.gov/pub/pmc/deprecated/oa_package/aa/bb/PMC9999997.tar.gz"
+            tgz_data = make_tgz(
+                {
+                    "PMC9999997/article-a.pdf": b"%PDF-1.4\na",
+                    "PMC9999997/article-b.pdf": b"%PDF-1.4\nb",
+                }
+            )
+
+            def route(url: str) -> FakeResponse:
+                if "pmc/utils/oa/oa.fcgi" in url:
+                    return FakeResponse(
+                        pmc_oa_payload(
+                            "PMC9999997",
+                            [("tgz", "ftp://ftp.ncbi.nlm.nih.gov/pub/pmc/oa_package/aa/bb/PMC9999997.tar.gz")],
+                        ),
+                        "text/xml",
+                        url,
+                    )
+                if url == tgz_url:
+                    return FakeResponse(tgz_data, "application/x-gzip", url, content_length=len(tgz_data))
+                if url == "https://pmc.ncbi.nlm.nih.gov/articles/PMC9999997/pdf/":
+                    return FakeResponse(b"<html>not pdf</html>", "text/html", url)
+                if url == "https://pmc.ncbi.nlm.nih.gov/articles/PMC9999997/":
+                    return FakeResponse(b"<html>no pdf</html>", "text/html", url)
+                if "api.semanticscholar.org" in url:
+                    raise HTTPError(url, 429, "Too Many Requests", hdrs=None, fp=None)
+                raise AssertionError(f"unexpected URL: {url}")
+
+            messages, _calls = self.run_with_fake_network(item_dir, route)
+
+            self.assertFalse((item_dir / "paper.pdf").exists())
+            self.assertTrue(any("複数あり自動選択できなかった" in message for message in messages))
+
+    def test_pmc_proof_of_work_html_is_logged_and_not_saved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            item_dir = write_item(
+                Path(tmpdir),
+                {
+                    "pmcid": "PMC1234567",
+                    "pdf_url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC1234567/pdf/",
+                    "title": "Example Paper",
+                },
+            )
+            pow_html = b"<html><title>Preparing to download ...</title><script>const POW_CHALLENGE = 'x'</script></html>"
+
+            def route(url: str) -> FakeResponse:
+                if url == "https://pmc.ncbi.nlm.nih.gov/articles/PMC1234567/pdf/":
+                    return FakeResponse(pow_html, "text/html", url)
+                if "pmc/utils/oa/oa.fcgi" in url:
+                    return FakeResponse(pmc_oa_not_open_payload("PMC1234567"), "text/xml", url)
+                if url == "https://pmc.ncbi.nlm.nih.gov/articles/PMC1234567/":
+                    return FakeResponse(b"<html>no pdf</html>", "text/html", url)
+                if "api.semanticscholar.org" in url:
+                    raise HTTPError(url, 429, "Too Many Requests", hdrs=None, fp=None)
+                raise AssertionError(f"unexpected URL: {url}")
+
+            messages, _calls = self.run_with_fake_network(item_dir, route)
+
+            self.assertFalse((item_dir / "paper.pdf").exists())
+            self.assertTrue(any("PMC proof-of-work HTML" in message for message in messages))
 
     def test_semantic_scholar_429_logs_without_metadata_update(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -332,6 +596,8 @@ class DownloadPriorResearchTests(unittest.TestCase):
             def route(url: str) -> FakeResponse:
                 if url == "https://pmc.ncbi.nlm.nih.gov/articles/PMC1234567/pdf/":
                     return FakeResponse(b"<html>not pdf</html>", "text/html", url)
+                if "pmc/utils/oa/oa.fcgi" in url:
+                    return FakeResponse(pmc_oa_not_open_payload("PMC1234567"), "text/xml", url)
                 if url == "https://pmc.ncbi.nlm.nih.gov/articles/PMC1234567/":
                     return FakeResponse(b"<html>no pdf link</html>", "text/html", url)
                 if "api.semanticscholar.org" in url:

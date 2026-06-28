@@ -156,6 +156,10 @@ ingested_at: ""
 - `metadata.yaml`の`pdf_url`が公開・合法アクセス可能なPDFを指す場合だけ、`paper.pdf`として取得してよい。
 - 雑誌HPのPDFが見つからない、HTML応答、HTTP 403/challenge、有料公開などで保存できず、PMCIDまたはPMC Free Full Textが確認できる場合は、PMCの公開PDFを取得候補にする。
 - PMCIDは`metadata.yaml`の`pmcid`、`paper_url`、`pdf_url`から拾う。PMCIDが直接ない場合は、公開情報である`pmid`、PubMed URL、DOIをNCBI PMC ID Converterに問い合わせてPMCIDを確認してよい。
+- PMCIDが分かった場合は、PMCのWeb PDF URLより先にPMC OA Web Service APIを確認する。OA APIが返す`ftp://ftp.ncbi.nlm.nih.gov/pub/pmc/oa_pdf/...`や`oa_package/...`は、PMC FTP Serviceの2026年4月以降の配置に合わせて`https://ftp.ncbi.nlm.nih.gov/pub/pmc/deprecated/...`へ変換してよい。
+- PMC OA APIにPDF linkがある場合は、その公開PDFだけを`paper.pdf`として保存する。成功時は`pdf_url`と`access_note`を更新し、licenseとOA API URLを残す。
+- PMC OA APIにtgz packageだけがある場合は、250MB以下のpackageだけを一時取得し、PMCID配下の本文PDFだけを抽出して`paper.pdf`にする。`supplement`、`supp`、`mmc`、`appendix`など補足資料らしいPDFは本文PDFとして扱わない。本文PDFを一意に選べない場合は保存しない。
+- PMCの通常PDF URLが`POW_CHALLENGE`や`Preparing to download`を含むHTMLを返す場合は、PMC proof-of-work HTMLとして記録し、自動アクセス防御を回避しない。
 - `pdf_url`が空、HTTP失敗、HTML応答、landing page応答などで`paper.pdf`を保存できない場合は、Semantic Scholar Academic Graph APIの`openAccessPdf`を確認してよい。
 - Semantic Scholar経由で使ってよいのは、`openAccessPdf.url`が示す公開OA候補と、そこから明確に導けるarXiv/PMCのPDFだけに限定する。paywall回避や認証回避には使わない。
 - Semantic Scholar API keyは任意の環境変数`SEMANTIC_SCHOLAR_API_KEY`だけを使う。API keyを`metadata.yaml`、`idea_notes.md`、ログへ書かない。
@@ -175,7 +179,7 @@ uv run python .agents/skills/01-prior-research/scripts/download_prior_research.p
 ```
 
 このscriptは`metadata.yaml`の`pdf_url`と`code_url`を読み、公開PDFを取得し、`code_url`はcloneせず`gitingest` Python APIで`source.md`へ直接変換する。取得だけに止めたい場合だけ`--no-ingest`を付ける。ただしsource code本体は保存しないため、`--no-ingest`時は`code_url`から`source.md`も作成しない。
-`paper.pdf`を保存できない場合は、PMC Free Full Textの公開PDFを先に確認し、それでも取得できない場合にSemantic Scholar `openAccessPdf`を確認する。成功した場合だけ`metadata.yaml`の`pdf_url`、`pmcid`、`access_note`を更新する。取得できない理由は`idea_notes.md`に記録し、`paper.md`は作成しない。未取得のまま残る場合は、手動PDF取得候補URLと保存先を必ず出す。
+`paper.pdf`を保存できない場合は、PMC OA API、PMC Web PDF候補、Semantic Scholar `openAccessPdf`の順に確認する。成功した場合だけ`metadata.yaml`の`pdf_url`、`pmcid`、`access_note`を更新する。ただしPMC OA tgz packageから本文PDFを抽出した場合、`pdf_url`は直接PDF URLではないため更新せず、`access_note`へpackage URLとpackage内PDF pathを残す。取得できない理由は`idea_notes.md`に記録し、`paper.md`は作成しない。未取得のまま残る場合は、手動PDF取得候補URLと保存先を必ず出す。
 
 複数の先行研究をまとめて取得した後、未取得PDFが1件でもある場合は、最終応答に次の表を含める。
 

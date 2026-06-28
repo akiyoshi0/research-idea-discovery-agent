@@ -12,8 +12,11 @@ import re
 import shutil
 import subprocess
 import ssl
+import tarfile
+import tempfile
 import urllib.error
 import urllib.request
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote, urlencode, urljoin, urlparse
@@ -23,6 +26,10 @@ USER_AGENT = "IdeaDiscoveryWorkspace/0.1"
 SEMANTIC_SCHOLAR_API_ROOT = "https://api.semanticscholar.org/graph/v1"
 SEMANTIC_SCHOLAR_FIELDS = "title,externalIds,openAccessPdf,isOpenAccess,url"
 PMC_IDCONV_API_URL = "https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/"
+PMC_OA_API_URL = "https://www.ncbi.nlm.nih.gov/pmc/utils/oa/oa.fcgi"
+PMC_FTP_HOST = "ftp.ncbi.nlm.nih.gov"
+MAX_PMC_OA_TGZ_BYTES = 250 * 1024 * 1024
+SUPPLEMENTAL_PDF_TOKENS = ("supplement", "supp", "mmc", "appendix")
 DIRECT_PYTHON_OVERRIDE_ENV = "IDEA_DISCOVERY_ALLOW_DIRECT_PYTHON"
 SCRIPT_RELATIVE_PATH = ".agents/skills/01-prior-research/scripts/download_prior_research.py"
 
@@ -153,6 +160,11 @@ def is_likely_pdf(data: bytes, content_type: str) -> bool:
     if "pdf" in content_type.lower() and b"<html" not in head:
         return True
     return False
+
+
+def is_pmc_pow_html(data: bytes) -> bool:
+    head = data[:4096].decode("utf-8", errors="ignore")
+    return "POW_CHALLENGE" in head or "Preparing to download" in head
 
 
 def normalize_doi(value: str) -> str:
@@ -487,6 +499,231 @@ def pmc_pdf_url(pmcid: str) -> str:
     return f"{pmc_article_url(pmcid)}pdf/"
 
 
+def pmc_oa_api_url(pmcid: str) -> str:
+    return f"{PMC_OA_API_URL}?{urlencode({'id': pmcid})}"
+
+
+def normalize_pmc_oa_download_url(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.netloc.lower() != PMC_FTP_HOST:
+        return url
+
+    path = parsed.path.lstrip("/")
+    if path.startswith("pub/pmc/deprecated/"):
+        normalized_path = path
+    elif path.startswith("pub/pmc/"):
+        normalized_path = f"pub/pmc/deprecated/{path.removeprefix('pub/pmc/')}"
+    else:
+        normalized_path = path
+
+    return f"https://{PMC_FTP_HOST}/{normalized_path}"
+
+
+def fetch_pmc_oa_xml(pmcid: str) -> tuple[ET.Element | None, str]:
+    url = pmc_oa_api_url(pmcid)
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            data = response.read()
+    except urllib.error.HTTPError as error:
+        if error.code in {401, 403, 407, 429}:
+            return None, f"PMC OA API取得を停止した: HTTP {error.code}。認証、rate limit、またはアクセス制限の可能性がある"
+        return None, f"PMC OA API取得に失敗した: HTTP {error.code}"
+    except Exception as error:  # noqa: BLE001
+        return None, f"PMC OA API取得に失敗した: {error}"
+
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError as error:
+        return None, f"PMC OA API応答をXMLとして読めなかった: {error}"
+    return root, "PMC OA API応答を取得した"
+
+
+def pmc_oa_links_from_xml(root: ET.Element) -> tuple[list[dict[str, str]], list[str]]:
+    messages: list[str] = []
+    error_node = root.find("error")
+    if error_node is not None:
+        code = error_node.get("code", "")
+        detail = (error_node.text or "").strip()
+        if code == "idIsNotOpenAccess":
+            messages.append(
+                "PMC OA APIではOpen Access Subset対象外だった。PMC Free Full Textページがあっても、"
+                "OA APIでPDF/package配布されるとは限らない"
+            )
+        else:
+            suffix = f": {detail}" if detail else ""
+            messages.append(f"PMC OA APIがエラーを返した: {code}{suffix}")
+        return [], messages
+
+    links: list[dict[str, str]] = []
+    for record in root.findall(".//record"):
+        license_value = record.get("license", "")
+        citation = record.get("citation", "")
+        for link_node in record.findall("link"):
+            format_value = (link_node.get("format", "") or "").lower()
+            href = (link_node.get("href", "") or "").strip()
+            if format_value not in {"pdf", "tgz"} or not href:
+                continue
+            normalized_url = normalize_pmc_oa_download_url(href)
+            links.append(
+                {
+                    "format": format_value,
+                    "url": normalized_url,
+                    "original_url": href,
+                    "license": license_value,
+                    "citation": citation,
+                }
+            )
+
+    if links:
+        messages.append(
+            "PMC OA APIから取得候補を得た: "
+            + ", ".join(f"{link['format']}={link['url']}" for link in links)
+        )
+    else:
+        messages.append("PMC OA API応答にPDFまたはtgz package候補がなかった")
+    return links, messages
+
+
+def pmc_oa_access_note(pmcid: str, api_url: str, source_url: str, license_value: str, member_path: str = "") -> str:
+    parts = [
+        f"PMC OA API経由で取得: {source_url}",
+        f"PMCID={pmcid}",
+        f"PMC OA API URL={api_url}",
+    ]
+    if member_path:
+        parts.append(f"package内PDF={member_path}")
+    if license_value:
+        parts.append(f"license={license_value}")
+    return "; ".join(parts)
+
+
+def doi_suffix_token(metadata: dict[str, str]) -> str:
+    doi = normalize_doi(metadata.get("doi", ""))
+    if not doi or "/" not in doi:
+        return ""
+    suffix = doi.rsplit("/", 1)[-1]
+    return re.sub(r"[^a-z0-9]+", "", suffix.lower())
+
+
+def is_supplemental_pdf_name(name: str) -> bool:
+    lowered = name.lower()
+    return any(token in lowered for token in SUPPLEMENTAL_PDF_TOKENS)
+
+
+def tgz_pdf_candidates(tgz_path: Path, pmcid: str) -> tuple[list[tarfile.TarInfo], str]:
+    try:
+        with tarfile.open(tgz_path, "r:gz") as archive:
+            candidates: list[tarfile.TarInfo] = []
+            supplemental_candidates: list[str] = []
+            for member in archive.getmembers():
+                member_name = member.name.strip("/")
+                parts = member_name.split("/")
+                if not member.isfile() or len(parts) < 2:
+                    continue
+                if parts[0].upper() != pmcid.upper():
+                    continue
+                filename = parts[-1]
+                if not filename.lower().endswith(".pdf"):
+                    continue
+                if is_supplemental_pdf_name(filename):
+                    supplemental_candidates.append(member_name)
+                    continue
+                candidates.append(member)
+    except (tarfile.TarError, OSError) as error:
+        return [], f"PMC OA packageをtar.gzとして読めなかった: {error}"
+
+    if candidates:
+        return candidates, f"PMC OA package内の本文PDF候補: {', '.join(member.name for member in candidates)}"
+    if supplemental_candidates:
+        return [], f"PMC OA package内に補足資料PDFしか見つからなかった: {', '.join(supplemental_candidates)}"
+    return [], "PMC OA package内にPMCID配下の本文PDF候補が見つからなかった"
+
+
+def choose_tgz_article_pdf(candidates: list[tarfile.TarInfo], metadata: dict[str, str]) -> tuple[tarfile.TarInfo | None, str]:
+    if not candidates:
+        return None, "本文PDF候補がないため選択できなかった"
+
+    main_candidates = [member for member in candidates if Path(member.name).name.lower() == "main.pdf"]
+    if len(main_candidates) == 1:
+        return main_candidates[0], f"main.pdfを本文PDFとして選択した: {main_candidates[0].name}"
+
+    suffix_token = doi_suffix_token(metadata)
+    if suffix_token:
+        suffix_matches = [
+            member
+            for member in candidates
+            if re.sub(r"[^a-z0-9]+", "", Path(member.name).stem.lower()).startswith(suffix_token)
+        ]
+        if len(suffix_matches) == 1:
+            return suffix_matches[0], f"DOI末尾に一致するPDFを本文PDFとして選択した: {suffix_matches[0].name}"
+
+    if len(candidates) == 1:
+        return candidates[0], f"非補足PDFが1件だけのため本文PDFとして選択した: {candidates[0].name}"
+
+    return None, f"本文PDF候補が複数あり自動選択できなかった: {', '.join(member.name for member in candidates)}"
+
+
+def download_url_to_temp(url: str, max_bytes: int) -> tuple[Path | None, str]:
+    if looks_sensitive_url(url):
+        return None, "URLに認証情報・token・privateを示す文字列があるため取得を停止した"
+    if not is_http_url(url):
+        return None, f"URLがHTTP(S)ではないため取得をスキップした: {url}"
+
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    temp_path: Path | None = None
+    try:
+        with urllib.request.urlopen(request, timeout=90) as response:
+            content_length = response.headers.get("Content-Length", "")
+            if content_length.isdigit() and int(content_length) > max_bytes:
+                return None, f"PMC OA packageが大きすぎるため取得しなかった: {content_length} bytes > {max_bytes} bytes"
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".tar.gz") as temp_file:
+                temp_path = Path(temp_file.name)
+                total = 0
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        temp_file.close()
+                        temp_path.unlink(missing_ok=True)
+                        return None, f"PMC OA packageが上限を超えたため取得を停止した: {total} bytes > {max_bytes} bytes"
+                    temp_file.write(chunk)
+    except urllib.error.HTTPError as error:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+        if error.code in {401, 403, 407, 429}:
+            return None, f"PMC OA package取得を停止した: HTTP {error.code}。認証、rate limit、またはアクセス制限の可能性がある"
+        return None, f"PMC OA package取得に失敗した: HTTP {error.code}"
+    except Exception as error:  # noqa: BLE001
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+        return None, f"PMC OA package取得に失敗した: {error}"
+
+    if temp_path is None:
+        return None, "PMC OA packageを一時ファイルへ保存できなかった"
+    return temp_path, f"PMC OA packageを一時ファイルへ取得した: {url}"
+
+
+def extract_pdf_from_tgz(tgz_path: Path, member: tarfile.TarInfo, destination: Path) -> str:
+    try:
+        with tarfile.open(tgz_path, "r:gz") as archive:
+            extracted = archive.extractfile(member.name)
+            if extracted is None:
+                return f"PMC OA package内PDFを開けなかった: {member.name}"
+            data = extracted.read()
+    except (tarfile.TarError, OSError) as error:
+        return f"PMC OA package内PDFの抽出に失敗した: {error}"
+
+    if not is_likely_pdf(data, "application/pdf"):
+        return f"PMC OA package内PDFがPDFではない可能性があるため保存しなかった: {member.name}"
+
+    destination.write_bytes(data)
+    return f"PMC OA packageからPDFを抽出した: {member.name}"
+
+
 def fetch_html(url: str) -> tuple[str | None, str]:
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
@@ -618,6 +855,8 @@ def download_pdf(pdf_url: str, destination: Path, force: bool) -> str:
     if looks_sensitive_url(final_url):
         return "redirect先URLに認証情報・token・privateを示す文字列があるためPDF保存を停止した"
     if not is_likely_pdf(data, content_type):
+        if is_pmc_pow_html(data):
+            return "PMC proof-of-work HTMLが返ったためpaper.pdfとして保存しなかった。自動アクセス防御は回避しない"
         return "PDFではない応答の可能性があるため保存しなかった。HTML、login、paywall、landing pageの可能性がある"
 
     destination.write_bytes(data)
@@ -685,6 +924,83 @@ def download_semantic_scholar_pdf(
     return messages
 
 
+def download_pmc_oa_pdf(
+    pmcid: str,
+    metadata: dict[str, str],
+    metadata_path: Path,
+    destination: Path,
+    force: bool,
+) -> list[str]:
+    api_url = pmc_oa_api_url(pmcid)
+    messages = [f"PMC OA APIによるPDF/package取得を試行した: {api_url}"]
+    root, fetch_message = fetch_pmc_oa_xml(pmcid)
+    messages.append(fetch_message)
+    if root is None:
+        return messages
+
+    links, link_messages = pmc_oa_links_from_xml(root)
+    messages.extend(link_messages)
+    if not links:
+        return messages
+
+    pdf_links = [link for link in links if link["format"] == "pdf"]
+    tgz_links = [link for link in links if link["format"] == "tgz"]
+
+    for link in pdf_links:
+        candidate_url = link["url"]
+        messages.append(f"PMC OA APIのPDF候補を試行した: {candidate_url}")
+        pdf_message = download_pdf(candidate_url, destination, force)
+        messages.append(f"PMC OA API PDF候補の取得結果: {pdf_message}")
+        if destination.exists():
+            messages.append(update_metadata_value(metadata_path, "pdf_url", candidate_url))
+            messages.append(
+                append_metadata_note(
+                    metadata_path,
+                    "access_note",
+                    pmc_oa_access_note(pmcid, api_url, candidate_url, link.get("license", "")),
+                )
+            )
+            return messages
+
+    for link in tgz_links:
+        package_url = link["url"]
+        messages.append(f"PMC OA APIのtgz package候補を試行した: {package_url}")
+        temp_path, download_message = download_url_to_temp(package_url, MAX_PMC_OA_TGZ_BYTES)
+        messages.append(download_message)
+        if temp_path is None:
+            continue
+        try:
+            candidates, candidate_message = tgz_pdf_candidates(temp_path, pmcid)
+            messages.append(candidate_message)
+            selected, select_message = choose_tgz_article_pdf(candidates, metadata)
+            messages.append(select_message)
+            if selected is None:
+                continue
+
+            extract_message = extract_pdf_from_tgz(temp_path, selected, destination)
+            messages.append(extract_message)
+            if destination.exists():
+                messages.append(
+                    append_metadata_note(
+                        metadata_path,
+                        "access_note",
+                        pmc_oa_access_note(
+                            pmcid,
+                            api_url,
+                            package_url,
+                            link.get("license", ""),
+                            member_path=selected.name,
+                        ),
+                    )
+                )
+                return messages
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+    messages.append("PMC OA API候補からpaper.pdfを保存できなかった")
+    return messages
+
+
 def pmc_access_note(pmcid: str, pdf_url: str) -> str:
     return (
         f"PMC Free Full Text経由で取得: {pdf_url}; "
@@ -707,6 +1023,13 @@ def download_pmc_pdf(
     messages.append(update_metadata_value(metadata_path, "pmcid", pmcids[0]))
 
     for pmcid in pmcids:
+        oa_messages = download_pmc_oa_pdf(pmcid, metadata, metadata_path, destination, force)
+        messages.extend(oa_messages)
+        if destination.exists():
+            if pmcid != pmcids[0]:
+                messages.append(update_metadata_value(metadata_path, "pmcid", pmcid))
+            return messages
+
         candidate_urls = [pmc_pdf_url(pmcid)]
         for candidate_url in candidate_urls:
             pdf_message = download_pdf(candidate_url, destination, force)
@@ -746,6 +1069,9 @@ def manual_pdf_candidate_urls(metadata: dict[str, str]) -> list[str]:
 
     pmcids = direct_pmcids_from_metadata(metadata)
     for pmcid in pmcids:
+        api_url = pmc_oa_api_url(pmcid)
+        if api_url not in candidates:
+            candidates.append(api_url)
         candidate = pmc_pdf_url(pmcid)
         if candidate not in candidates:
             candidates.append(candidate)
@@ -763,8 +1089,25 @@ def manual_pdf_candidate_urls(metadata: dict[str, str]) -> list[str]:
     return candidates
 
 
-def manual_pdf_download_guidance(metadata: dict[str, str], destination: Path) -> str:
+def urls_from_messages(messages: list[str]) -> list[str]:
+    urls: list[str] = []
+    for message in messages:
+        for url in re.findall(r"https?://[^\s,;]+", message):
+            cleaned = url.rstrip(").]")
+            if cleaned not in urls:
+                urls.append(cleaned)
+    return urls
+
+
+def manual_pdf_download_guidance(
+    metadata: dict[str, str],
+    destination: Path,
+    extra_candidates: list[str] | None = None,
+) -> str:
     candidates = manual_pdf_candidate_urls(metadata)
+    for candidate in extra_candidates or []:
+        if is_http_url(candidate) and candidate not in candidates:
+            candidates.append(candidate)
     candidate_text = ", ".join(candidates) if candidates else "候補URLなし。paper_url、pdf_url、doi、pmcidをmetadata.yamlに追記してください"
     return f"手動PDF取得候補URL: {candidate_text}; 保存先: {destination}"
 
@@ -834,7 +1177,7 @@ def download_prior_research(
         if not pdf_path.exists():
             messages.append("paper.pdfを保存できなかったためpaper.mdは作成しない。paper.mdは必ずpaper.pdfから変換する")
             latest_metadata = read_simple_metadata(metadata_path)
-            messages.append(manual_pdf_download_guidance(latest_metadata, pdf_path))
+            messages.append(manual_pdf_download_guidance(latest_metadata, pdf_path, urls_from_messages(messages)))
     if not pdf_only:
         if code_url:
             if ingest_after_download:
