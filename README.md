@@ -1,22 +1,69 @@
-# Idea Discovery Workspace
+# 研究アイデア創出エージェント
 
-このワークスペースは、研究者の初期的な関心を、具体的な`discovery_state/research_plan.md`へ落とし込むためのローカル環境です。
+研究者がCodexと並走しながら、研究領域の整理、先行研究の読解、仮説生成、軽いデータ確認、研究計画化まで進めるためのローカルworkspaceです。
 
-cloneして使う詳しい手順は、[Cloneして使うための説明書](docs/clone_usage_guide_ja.md)を参照してください。
+これは完成済みのWebアプリではありません。CodexとMarkdownを使う「研究アイデア探索用の作業机」です。独自Web UI、データベース、ベクトルDB、複雑なmulti-agent基盤は使いません。
 
-構成は意図的に小さく保ちます。
+cloneして使う詳しい手順は、[Cloneして使うための説明書](docs/clone_usage_guide_ja.md)を読んでください。
 
-```text
-Codex
-+ Markdown
-+ 4 focused skills
-+ 5 discovery_state files
-+ prior_research/
-+ data/
-+ probes/
+## できること
+
+- 研究の関心や制約を`discovery_brief.md`に書き、分野の全体像を整理する
+- 先行研究PDFや公開repositoryをMarkdown化し、研究アイデア探索用のメモにする
+- 未解決問題と仮説候補を`discovery_state/`に蓄積する
+- 公開データで仮説の実行可能性を軽く確認する
+- 人間が選んだ仮説だけを`research_plan.md`へまとめる
+
+最終的な研究テーマはCodexが勝手に決めません。候補を整理し、根拠や弱点を見えるようにして、人間が判断しやすくするための仕組みです。
+
+## 最短の始め方
+
+```bash
+git clone https://github.com/akiyoshi0/research-idea-discovery-agent.git
+cd research-idea-discovery-agent
+uv sync
 ```
 
-独自Web UI、データベース、ベクトルDB、複雑なmulti-agent基盤、自律的なテーマ決定機構、大規模実験パイプラインは作りません。
+次に、`discovery_brief.md`へ研究の出発点を書きます。
+
+```markdown
+## 研究領域
+
+化学的摂動応答予測モデル
+
+## 研究の方向性
+
+- 何を明らかにしたいか:
+- 重視したい観点:
+- 伸ばしたい方向:
+- 比較したい既存手法・立場:
+```
+
+その後、Codexに次のように依頼します。
+
+```text
+AGENTS.mdとdiscovery_brief.mdを読んでください。
+00-idea-discovery skillで、まずfield_map.mdを更新してください。
+まだ仮説の確定やresearch_plan.mdの作成はしないでください。
+```
+
+## 基本の流れ
+
+このworkspaceは直線的に一度だけ実行するものではありません。`00`から`02`を何度も往復し、仮説が十分育ったら`03`で研究計画にします。
+
+```text
+00 idea-discovery
+  ↓ 分野整理、gap抽出、仮説生成
+01 prior-research
+  ↓ 必要な論文・コードを整理
+00 revise-hypotheses
+  ↓ 仮説を見直す
+02 data-probe
+  ↓ 公開データで軽く現実確認
+00 revise-hypotheses
+  ↓ 十分に育った候補を人間が選ぶ
+03 research-plan
+```
 
 ## 4つのskill
 
@@ -28,118 +75,119 @@ Codex
 └── 03-research-plan/
 ```
 
-- `00-idea-discovery`: 分野整理、gap抽出、仮説生成、仮説再考。
-- `01-prior-research`: 先行研究の追加、PDFとsource.md整理、Markdown化、idea notes作成。
-- `02-data-probe`: 公開データ確認、軽いprobe、data/README.mdとprobe.md更新。
-- `03-research-plan`: 仮説の批判・順位づけ、人間の選択確認、research_plan.md作成。
+| skill | 役割 |
+|---|---|
+| `00-idea-discovery` | 分野整理、gap抽出、仮説生成、仮説再考 |
+| `01-prior-research` | 先行研究の追加、PDF/source整理、Markdown化、idea notes作成 |
+| `02-data-probe` | 公開データ確認、軽いprobe、`data/README.md`と`probe.md`更新 |
+| `03-research-plan` | 仮説の批判・順位づけ、人間の選択確認、`research_plan.md`作成 |
 
-## 使い方の流れ
-
-最初に`discovery_brief.md`を書く。その後は直線ではなく、`00`〜`02`を何度も往復して仮説を育てる。
+## 主要ファイル
 
 ```text
-00 idea-discovery
-  ↓ 必要な先行研究を特定
-01 prior-research
-  ↓ 文献・コードから知見を追加
-00 revise-hypotheses
-  ↓ 確認すべき仮説を選ぶ
-02 data-probe
-  ↓ 軽いデータ確認結果を追加
-00 revise-hypotheses
-  ↓ 候補が十分育ったら
-03 research-plan
+discovery_brief.md                  # 研究の出発点
+discovery_state/field_map.md        # 分野の地図
+discovery_state/gap_table.md        # 未解決問題
+discovery_state/hypothesis_bank.md  # 仮説候補
+discovery_state/decision_log.md     # 判断の記録
+discovery_state/research_plan.md    # 最終的な研究計画
+prior_research/                     # 先行研究ごとのPDF・Markdown・メモ
+data/README.md                      # 利用データの整理
+probes/                             # 軽い確認用probe
 ```
 
-最終的な仮説は人間が選ぶ。Codexが勝手に最終テーマを決めない。
+## よく使う依頼文
 
-## 最初の依頼例
+分野を整理する:
 
 ```text
-AGENTS.mdとdiscovery_brief.mdを読んでください。
-00-idea-discovery skillのmap-fieldとして動作し、
-discovery_state/field_map.mdを更新してください。
-まだ仮説の確定やresearch_plan.mdの作成はしないでください。
+00-idea-discovery skillで、discovery_brief.mdをもとにfield_map.mdを更新してください。
 ```
 
-## 先行研究ワークフロー
-
-先行研究を追加するとき:
+gapと仮説を作る:
 
 ```text
-01-prior-research skillで、先行研究 paper_a の置き場を作り、
-metadata.yamlとidea_notes.mdを初期化してください。
+00-idea-discovery skillで、field_map.mdからgap_table.mdとhypothesis_bank.mdを更新してください。
 ```
 
-PDFやcode_urlをMarkdown化するとき:
+先行研究を追加・取得する:
 
 ```text
-01-prior-research skillで、prior_research/paper_a のPDFとcode_urlをMarkdown化してください。
-失敗やスキップがあればidea_notes.mdに記録してください。
+01-prior-research skillで、この仮説に必要な先行研究を追加し、PDF取得とMarkdown化まで行ってください。
+取得できないPDFがあれば、理由、手動確認URL、paper.pdfの保存先を示してください。
 ```
 
-## data-probeワークフロー
+データで軽く確認する:
 
 ```text
-02-data-probe skillで、HYP-001の実行可能性を軽く確認するprobeを作ってください。
-本格解析はせず、probe.mdとdata/README.mdに結果を記録してください。
+02-data-probe skillで、H01の実行可能性を公開データで軽く確認してください。
+本格解析にはせず、probe.mdとdata/README.mdに結果を記録してください。
 ```
 
-## 研究計画化
+研究計画にする:
 
 ```text
-03-research-plan skillで、hypothesis_bank.mdの候補をcritique-rankしてください。
+03-research-plan skillで、hypothesis_bank.mdの候補を批判・順位づけしてください。
 人間が選んだ仮説だけをresearch_plan.mdにしてください。
 ```
 
-## Helper Scripts
+## 先行研究の取得とMarkdown化
 
-scriptsはCodexの補助とスモークテスト用です。主なユーザーインターフェースではありません。
-
-必要な場合だけ、手動で以下を実行できます。
+通常はCodexに`01-prior-research` skillで依頼します。必要な場合だけ、手動でhelper scriptを実行できます。
 
 ```bash
-uv run python scripts/init_idea_discovery_workspace.py
 uv run python .agents/skills/01-prior-research/scripts/init_prior_research_item.py paper_a
 uv run python .agents/skills/01-prior-research/scripts/download_prior_research.py prior_research/paper_a
-uv run python .agents/skills/01-prior-research/scripts/ingest_prior_research.py prior_research/paper_a  # 再Markdown化だけを行う場合
-uv run python .agents/skills/02-data-probe/scripts/init_probe.py probe_001_short_name
+uv run python .agents/skills/01-prior-research/scripts/ingest_prior_research.py prior_research/paper_a
 ```
 
-`download_prior_research.py`は、PDF取得と`code_url`からの`source.md`直接作成を行い、`paper.md`/`source.md`へのMarkdown化まで一括で実行します。取得だけに止めたい場合は`--no-ingest`を付けます。ただしsource code本体は保存しないため、`--no-ingest`時は`code_url`から`source.md`も作成しません。
+`download_prior_research.py`は、PDF取得と`code_url`からの`source.md`作成を行い、取得後に`paper.md`/`source.md`へのMarkdown化も実行します。取得だけに止めたい場合は`--no-ingest`を付けます。
 
-PDF取得は、`metadata.yaml`の`pdf_url`を最初に試し、失敗した場合はPMC OA Web Service API、PMC Web PDF候補、Semantic Scholar `openAccessPdf`の順で確認します。PMC OA APIが古い`ftp://ftp.ncbi.nlm.nih.gov/pub/pmc/oa_pdf/...`や`oa_package/...`を返す場合は、PMC FTP Serviceの2026年4月以降の配置に合わせて`https://ftp.ncbi.nlm.nih.gov/pub/pmc/deprecated/...`へ変換します。OA APIのtgz packageしかない場合は、250MB以下のpackageから本文PDFだけを抽出します。
+PDF取得は次の順で試します。
 
-## 初回セットアップ
+```text
+metadata.yamlのpdf_url
+→ PMC OA Web Service API
+→ PMC Web PDF候補
+→ Semantic Scholar openAccessPdf
+→ 手動確認URLと保存先を提示
+```
 
-PDFやcode_urlをMarkdown化する場合は、最初に`uv`で依存環境を同期してください。
+PMC OA APIが古い`ftp://ftp.ncbi.nlm.nih.gov/pub/pmc/oa_pdf/...`や`oa_package/...`を返す場合は、PMC FTP Serviceの2026年4月以降の配置に合わせて`https://ftp.ncbi.nlm.nih.gov/pub/pmc/deprecated/...`へ変換します。OA APIのtgz packageしかない場合は、250MB以下のpackageから本文PDFだけを抽出します。
+
+`paper.md`は必ず`paper.pdf`から作ります。PDFを保存できない場合、PMC XML、HTML、abstract、publisher本文、API本文から`paper.md`だけを作ることはしません。
+
+公開repositoryのsource code本体はworkspaceへclone保存しません。`metadata.yaml`の`code_url`を`gitingest` Python APIへ直接渡し、1ファイル100KB以下を対象にして`source.md`を作ります。
+
+## 依存環境
+
+初回は必ず次を実行してください。
 
 ```bash
 uv sync
 ```
 
-`.agents/skills/01-prior-research/scripts/ingest_prior_research.py`は、Markdown化に以下を使います。
-
-- `pymupdf4llm`: `paper.pdf`から`paper.md`への変換
-- `gitingest`: `code_url`または手動配置した`source/`から`source.md`への変換
-
-PDF変換時は`pymupdf4llm`の画像保存オプションを使い、論文中の画像を`prior_research/<paper_id>/figures/`へ保存し、`paper.md`内に画像pathを残します。
-`paper.md`は必ず`paper.pdf`から変換して作ります。PDFを保存できない場合は、PMC XML、HTML、abstract、publisher本文、API本文から`paper.md`だけを作りません。
-PMCの通常PDF URLがproof-of-work HTMLやcookie認証、出版社サイトがCloudflare challengeや403を返す場合、その防御は回避しません。取得できなかった場合は、手動確認URLと`paper.pdf`の保存先を`idea_notes.md`と応答に残します。
-公開repositoryのsource code本体はworkspaceへclone保存しません。`metadata.yaml`の`code_url`を`gitingest` Python APIへ直接渡し、`max_file_size=100 * 1024`で1ファイル100KB以下だけを対象にして`source.md`を作ります。`source/`は、人間がローカルsourceを手動配置した場合だけ使います。
-
-未導入の場合は勝手に別ライブラリや内製の簡易変換へfallbackせず、スキップ理由を`idea_notes.md`に記録します。これらがなくても、Markdownファイルを手動で用意すればワークスペースは利用できます。
-
-helper scriptを手動実行する場合は、同じ環境で実行します。
-`python ...`や`python3 ...`で直接実行せず、必ず`uv run python ...`を使ってください。
+Python helper scriptを手で動かす場合は、必ず`uv run python ...`を使います。
 
 ```bash
 uv run python .agents/skills/01-prior-research/scripts/download_prior_research.py prior_research/<paper_id>
 ```
 
-## Safety
+`python ...`や`python3 ...`で直接実行しないでください。workspaceの`.venv`ではなく別のPythonを使ってしまい、依存ライブラリが見つからない原因になります。
 
-- paywallを回避しない。
-- private repositoryを明示的な許可なしに取得しない。
-- private data、clinical data、個人情報、機密情報を人間の承認なしに外部サービスへ送らない。
-- 研究計画が固まる前に、`probes/`を本格解析へ膨らませない。
+主な依存ライブラリ:
+
+- `pymupdf4llm`: `paper.pdf`を`paper.md`へ変換する
+- `gitingest`: 公開repositoryを`source.md`へ変換する
+
+未導入の場合、別ライブラリや内製の簡易変換へ勝手にfallbackしません。`uv sync`で環境を整えるか、PDF/Markdownを手動で用意してください。
+
+## 安全方針
+
+- paywallを回避しない
+- login、cookie認証、Cloudflare challenge、PMC proof-of-workを回避しない
+- private repositoryを明示的な許可なしに取得しない
+- private data、clinical data、個人情報、機密情報を承認なしに外部サービスへ送らない
+- `probes/`は軽い現実確認に限定し、本格解析パイプラインにしない
+
+取得できなかったPDFは、理由、手動確認URL、`paper.pdf`の保存先を`idea_notes.md`と応答に残します。
